@@ -43,6 +43,16 @@
 #include "mmgsexterns_private.h"
 #include "mmgexterns_private.h"
 
+#ifdef WITH_CUDA
+#include "cuda/mmgs_cuda.h"
+#include <sys/time.h>
+static double mmgs_wtime(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+#endif
+
 /**
  * Pack the mesh \a mesh and its associated metric \a met and return \a val.
  */
@@ -548,6 +558,39 @@ int MMGS_mmgslib(MMG5_pMesh mesh,MMG5_pSol met)
   mytime    ctim[TIMEMAX];
   char      stim[32];
 
+#ifdef WITH_CUDA
+  /* Checkpoint helper macros */
+#define MMGS_MAYBE_SAVE(s) do {                                               \
+    if (mesh->info.cuda_save_dir &&                                            \
+        (mesh->info.cuda_save_all ||                                           \
+         mesh->info.cuda_save_stage == (int8_t)(s))) {                         \
+      MMGS_save_checkpoint(mesh, met, (MMGS_PipelineStage)(s),                 \
+                           mesh->info.cuda_save_dir);                          \
+    }                                                                          \
+    if (mesh->info.cuda_run_to >= 0 &&                                         \
+        (int8_t)(s) >= mesh->info.cuda_run_to) {                               \
+      fprintf(stdout,"[PIPELINE-S] Stopping at stage '%s'\n",                  \
+              MMGS_cuda_stage_name((MMGS_PipelineStage)(s)));                   \
+      goto mmgs_ckpt_done;                                                     \
+    }                                                                          \
+  } while(0)
+
+  /* Resume from checkpoint if requested */
+  if (mesh->info.cuda_run_from >= 0 && mesh->info.cuda_save_dir) {
+    MMGS_PipelineStage loaded;
+    loaded = MMGS_load_checkpoint(mesh, met, mesh->info.cuda_save_dir,
+                                  (MMGS_PipelineStage)mesh->info.cuda_run_from);
+    if (loaded == MMGS_STAGE_NONE) {
+      fprintf(stderr,"\n  ## ERROR: Failed to load checkpoint\n");
+      _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+    }
+    fprintf(stdout,"[PIPELINE-S] Resuming after stage '%s'\n",
+            MMGS_cuda_stage_name(loaded));
+  }
+#else
+#define MMGS_MAYBE_SAVE(s) ((void)0)
+#endif
+
   /** In debug mode, check that all structures are allocated */
   assert ( mesh );
   assert ( met );
@@ -632,39 +675,77 @@ int MMGS_mmgslib(MMG5_pMesh mesh,MMG5_pSol met)
   }
 
   /* scaling mesh */
+#ifdef WITH_CUDA
+  { double _pt0 = mmgs_wtime();
+#endif
   if ( !MMG5_scaleMesh(mesh,met,NULL) )   _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+#ifdef WITH_CUDA
+    fprintf(stdout,"[TIMING-S]   scaleMesh:     %.3f s\n", mmgs_wtime()-_pt0); }
+#endif
 
   MMGS_setfunc(mesh,met);
+  MMGS_MAYBE_SAVE(MMGS_STAGE_POST_SCALE);
 
   /* specific meshing */
   if ( mesh->info.hsiz > 0. ) {
+#ifdef WITH_CUDA
+    { double _pt0 = mmgs_wtime();
+#endif
     if ( !MMGS_Set_constantSize(mesh,met) ) {
       if ( !MMG5_unscaleMesh(mesh,met,NULL) )   _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
       _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
     }
+#ifdef WITH_CUDA
+      fprintf(stdout,"[TIMING-S]   constantSize:  %.3f s\n", mmgs_wtime()-_pt0); }
+#endif
   }
 
   /* mesh analysis */
+#ifdef WITH_CUDA
+  { double _pt0 = mmgs_wtime();
+#endif
   if ( !MMGS_analys(mesh) ) {
     if ( !MMG5_unscaleMesh(mesh,met,NULL) )
       _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
     MMGS_RETURN_AND_PACK(mesh,met,sol,MMG5_LOWFAILURE);
   }
+#ifdef WITH_CUDA
+    fprintf(stdout,"[TIMING-S]   analys:        %.3f s\n", mmgs_wtime()-_pt0); }
+#endif
+  MMGS_MAYBE_SAVE(MMGS_STAGE_POST_ANALYS);
 
   /* specific meshing: optim mode needs normal at vertices */
   if ( mesh->info.optim ) {
+#ifdef WITH_CUDA
+    { double _pt0 = mmgs_wtime();
+#endif
     if ( !MMGS_doSol(mesh,met) ) {
       if ( !MMG5_unscaleMesh(mesh,met,NULL) )   _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
       _LIBMMG5_RETURN(mesh,met,sol,MMG5_LOWFAILURE);
     }
+#ifdef WITH_CUDA
+      fprintf(stdout,"[TIMING-S]   doSol:         %.3f s\n", mmgs_wtime()-_pt0); }
+#endif
   }
 
   if ( mesh->info.imprim > 0 ||  mesh->info.imprim < -1 ) {
-    if ( !MMGS_inqua(mesh,met) ) {
-      if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
-      MMGS_RETURN_AND_PACK(mesh,met,sol,MMG5_LOWFAILURE);
+#ifdef WITH_CUDA
+    if (mesh->info.quality_strategy == 1) {
+      if ( !MMGS_triQual_cuda(mesh,met) ) {
+        if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+        MMGS_RETURN_AND_PACK(mesh,met,sol,MMG5_LOWFAILURE);
+      }
+    } else
+#endif
+    {
+      if ( !MMGS_inqua(mesh,met) ) {
+        if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+        MMGS_RETURN_AND_PACK(mesh,met,sol,MMG5_LOWFAILURE);
+      }
     }
   }
+
+  MMGS_MAYBE_SAVE(MMGS_STAGE_POST_INQUA);
 
   if ( mesh->info.imprim > 1 && met->m ) {
     MMGS_prilen(mesh,met,0);
@@ -695,6 +776,7 @@ int MMGS_mmgslib(MMG5_pMesh mesh,MMG5_pSol met)
   if ( mesh->info.imprim > 0 ) {
     fprintf(stdout,"  -- PHASE 2 COMPLETED.     %s\n",stim);
   }
+  MMGS_MAYBE_SAVE(MMGS_STAGE_POST_ADAPT);
 
   /* save file */
   if (!MMGS_outqua(mesh,met) ) {
@@ -709,9 +791,15 @@ int MMGS_mmgslib(MMG5_pMesh mesh,MMG5_pSol met)
   if ( mesh->info.imprim > 0 )  fprintf(stdout,"\n  -- MESH PACKED UP\n");
 
   if ( !MMG5_unscaleMesh(mesh,met,NULL) ) _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+  MMGS_MAYBE_SAVE(MMGS_STAGE_POST_UNSCALE);
 
   if ( !MMGS_packMesh(mesh,met,sol) ) _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
   chrono(OFF,&(ctim[1]));
+
+#ifdef WITH_CUDA
+mmgs_ckpt_done:
+#undef MMGS_MAYBE_SAVE
+#endif
 
   chrono(OFF,&ctim[0]);
   printim(ctim[0].gdif,stim);

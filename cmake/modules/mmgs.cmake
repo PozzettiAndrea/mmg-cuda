@@ -73,6 +73,20 @@ IF ( VTK_FOUND )
    ${MMGCOMMON_SOURCE_DIR}/vtkparser.cpp )
 ENDIF ( )
 
+# CUDA acceleration sources
+IF ( BUILD_CUDA )
+  FILE(GLOB mmgs_cuda_c_files
+    ${MMGS_SOURCE_DIR}/cuda/*.c
+    ${MMGS_SOURCE_DIR}/cuda/*.h)
+  FILE(GLOB mmgs_cuda_cu_files
+    ${MMGS_SOURCE_DIR}/cuda/*.cu)
+  LIST(APPEND mmgs_library_files ${mmgs_cuda_c_files})
+  IF ( mmgs_cuda_cu_files )
+    LIST(APPEND mmgs_library_files ${mmgs_cuda_cu_files})
+    SET_SOURCE_FILES_PROPERTIES(${mmgs_cuda_cu_files} PROPERTIES LANGUAGE CUDA)
+  ENDIF()
+ENDIF()
+
 FILE(
   GLOB
   mmgs_main_file
@@ -90,12 +104,20 @@ FILE(
 IF ( LIBMMGS_STATIC )
   ADD_AND_INSTALL_LIBRARY ( lib${PROJECT_NAME}s_a STATIC copy_s_headers
     "${mmgs_library_files}" ${PROJECT_NAME}s )
+  IF ( BUILD_CUDA )
+    SET_TARGET_PROPERTIES(lib${PROJECT_NAME}s_a PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    TARGET_LINK_LIBRARIES(lib${PROJECT_NAME}s_a PRIVATE CUDA::cudart)
+  ENDIF()
 ENDIF()
 
 # Compile shared library
 IF ( LIBMMGS_SHARED )
   ADD_AND_INSTALL_LIBRARY ( lib${PROJECT_NAME}s_so SHARED copy_s_headers
     "${mmgs_library_files}" ${PROJECT_NAME}s )
+  IF ( BUILD_CUDA )
+    SET_TARGET_PROPERTIES(lib${PROJECT_NAME}s_so PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    TARGET_LINK_LIBRARIES(lib${PROJECT_NAME}s_so PRIVATE CUDA::cudart)
+  ENDIF()
 ENDIF()
 
 # mmgs header files needed for library

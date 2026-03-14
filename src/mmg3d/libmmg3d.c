@@ -44,6 +44,10 @@
 #include "mmg3dexterns_private.h"
 #include "mmgexterns_private.h"
 
+#ifdef WITH_CUDA
+#include "cuda/mmg3d_cuda.h"
+#endif
+
 /**
  * Pack the mesh \a mesh and its associated metric \a met and/or solution \a sol
  * and return \a val.
@@ -977,6 +981,46 @@ int MMG3D_mmg3dlib(MMG5_pMesh mesh,MMG5_pSol met) {
   mytime    ctim[TIMEMAX];
   char      stim[32];
 
+#ifdef WITH_CUDA
+  int _mmg3d_resume_stage = -1;  /* -1 = run from beginning */
+
+  /* Checkpoint helper macros */
+#define MMG3D_STAGE_ACTIVE(s) (_mmg3d_resume_stage < (s))
+
+#define MMG3D_MAYBE_SAVE(s) do {                                              \
+    if (mesh->info.cuda_save_dir &&                                            \
+        (mesh->info.cuda_save_all ||                                           \
+         mesh->info.cuda_save_stage == (int8_t)(s))) {                         \
+      MMG3D_save_checkpoint(mesh, met, (MMG3D_PipelineStage)(s),               \
+                            mesh->info.cuda_save_dir);                         \
+    }                                                                          \
+    if (mesh->info.cuda_run_to >= 0 &&                                         \
+        (int8_t)(s) >= mesh->info.cuda_run_to) {                               \
+      fprintf(stdout,"[PIPELINE] Stopping at stage '%s'\n",                    \
+              MMG3D_stage_name((MMG3D_PipelineStage)(s)));                      \
+      goto mmg3d_ckpt_done;                                                    \
+    }                                                                          \
+  } while(0)
+
+  /* Resume from checkpoint if requested */
+  if (mesh->info.cuda_run_from >= 0 && mesh->info.cuda_save_dir) {
+    MMG3D_PipelineStage loaded;
+    loaded = MMG3D_load_checkpoint(mesh, met, mesh->info.cuda_save_dir,
+                                   (MMG3D_PipelineStage)mesh->info.cuda_run_from);
+    if (loaded == MMG3D_STAGE_NONE) {
+      fprintf(stderr,"\n  ## ERROR: Failed to load checkpoint for stage '%s'\n",
+              MMG3D_stage_name((MMG3D_PipelineStage)mesh->info.cuda_run_from));
+      _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+    }
+    _mmg3d_resume_stage = (int)loaded;
+    fprintf(stdout,"[PIPELINE] Resuming after stage '%s'\n",
+            MMG3D_stage_name(loaded));
+  }
+#else
+#define MMG3D_STAGE_ACTIVE(s) (1)
+#define MMG3D_MAYBE_SAVE(s) ((void)0)
+#endif
+
   /** In debug mode, check that all structures are allocated */
   assert ( mesh );
   assert ( met );
@@ -1096,7 +1140,23 @@ int MMG3D_mmg3dlib(MMG5_pMesh mesh,MMG5_pSol met) {
     }
   }
 
-  if ( !MMG3D_tetraQual(mesh,met,0) )   _LIBMMG5_RETURN(mesh,met,sol,MMG5_LOWFAILURE);
+  MMG3D_MAYBE_SAVE(MMG3D_STAGE_POST_SCALE);
+
+  /* Compute initial quality — with strategy dispatch */
+  if ( MMG3D_STAGE_ACTIVE(MMG3D_STAGE_POST_QUAL1) ) {
+#ifdef WITH_CUDA
+    if (mesh->info.quality_strategy == 1) {
+      /* GPU quality — stub: falls back to CPU for now */
+      if ( !MMG3D_tetraQual(mesh,met,0) )
+        _LIBMMG5_RETURN(mesh,met,sol,MMG5_LOWFAILURE);
+    } else
+#endif
+    {
+      if ( !MMG3D_tetraQual(mesh,met,0) )
+        _LIBMMG5_RETURN(mesh,met,sol,MMG5_LOWFAILURE);
+    }
+  }
+  MMG3D_MAYBE_SAVE(MMG3D_STAGE_POST_QUAL1);
 
   if ( mesh->info.imprim > 0  ||  mesh->info.imprim < -1 ) {
     if ( !MMG3D_inqua(mesh,met) ) {
@@ -1106,10 +1166,13 @@ int MMG3D_mmg3dlib(MMG5_pMesh mesh,MMG5_pSol met) {
   }
 
   /* mesh analysis */
-  if ( !MMG3D_analys(mesh) ) {
-    if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
-    _LIBMMG5_RETURN(mesh,met,sol,MMG5_LOWFAILURE);
+  if ( MMG3D_STAGE_ACTIVE(MMG3D_STAGE_POST_ANALYS) ) {
+    if ( !MMG3D_analys(mesh) ) {
+      if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+      _LIBMMG5_RETURN(mesh,met,sol,MMG5_LOWFAILURE);
+    }
   }
+  MMG3D_MAYBE_SAVE(MMG3D_STAGE_POST_ANALYS);
 
   if ( mesh->info.imprim > 1 && met->m ) MMG3D_prilen(mesh,met,0);
 
@@ -1156,6 +1219,7 @@ int MMG3D_mmg3dlib(MMG5_pMesh mesh,MMG5_pSol met) {
   if ( mesh->info.imprim > 0 ) {
     fprintf(stdout,"  -- PHASE 2 COMPLETED.     %s\n",stim);
   }
+  MMG3D_MAYBE_SAVE(MMG3D_STAGE_POST_ADAPT);
 
   /* last renum to give back a good numbering to the user */
   if ( !MMG5_scotchCall(mesh,met,NULL,NULL) )
@@ -1176,8 +1240,14 @@ int MMG3D_mmg3dlib(MMG5_pMesh mesh,MMG5_pSol met) {
   chrono(ON,&(ctim[1]));
   if ( mesh->info.imprim > 0 )  fprintf(stdout,"\n  -- MESH PACKED UP\n");
   if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+  MMG3D_MAYBE_SAVE(MMG3D_STAGE_POST_UNSCALE);
+
   if ( !MMG3D_packMesh(mesh,met,sol) )       _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
   chrono(OFF,&(ctim[1]));
+
+#ifdef WITH_CUDA
+mmg3d_ckpt_done:
+#endif
 
   chrono(OFF,&ctim[0]);
   printim(ctim[0].gdif,stim);
@@ -1185,6 +1255,12 @@ int MMG3D_mmg3dlib(MMG5_pMesh mesh,MMG5_pSol met) {
     fprintf(stdout,"\n   MMG3DLIB: ELAPSED TIME  %s\n",stim);
     fprintf(stdout,"\n  %s\n   END OF MODULE MMG3D\n  %s\n\n",MG_STR,MG_STR);
   }
+
+#ifdef WITH_CUDA
+#undef MMG3D_STAGE_ACTIVE
+#undef MMG3D_MAYBE_SAVE
+#endif
+
   _LIBMMG5_RETURN(mesh,met,sol,MMG5_SUCCESS);
 }
 

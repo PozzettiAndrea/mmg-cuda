@@ -145,6 +145,73 @@ int MMGS_parsar(int argc,char *argv[],MMG5_pMesh mesh,MMG5_pSol met,MMG5_pSol so
   i = 1;
   while ( i < argc ) {
     if ( *argv[i] == '-' ) {
+
+#ifdef WITH_CUDA
+      /* ---- CUDA strategy and checkpoint flags ---- */
+      if ( !strcmp(argv[i],"-quality") && i + 1 < argc ) {
+        ++i;
+        if ( !strcmp(argv[i],"cpu") )       mesh->info.quality_strategy = 0;
+        else if ( !strcmp(argv[i],"cuda") ) mesh->info.quality_strategy = 1;
+        else { fprintf(stderr,"\nUnknown -quality strategy: %s\n",argv[i]); return 0; }
+        i++; continue;
+      }
+      if ( !strcmp(argv[i],"-metvol") && i + 1 < argc ) {
+        ++i;
+        if ( !strcmp(argv[i],"cpu") )       mesh->info.metvol_strategy = 0;
+        else if ( !strcmp(argv[i],"cuda") ) mesh->info.metvol_strategy = 1;
+        else { fprintf(stderr,"\nUnknown -metvol strategy: %s\n",argv[i]); return 0; }
+        i++; continue;
+      }
+      if ( !strcmp(argv[i],"-gradation-strategy") && i + 1 < argc ) {
+        ++i;
+        if ( !strcmp(argv[i],"cpu") )       mesh->info.gradation_strategy = 0;
+        else if ( !strcmp(argv[i],"cuda") ) mesh->info.gradation_strategy = 1;
+        else { fprintf(stderr,"\nUnknown -gradation-strategy: %s\n",argv[i]); return 0; }
+        i++; continue;
+      }
+      if ( !strcmp(argv[i],"-save-dir") && i + 1 < argc ) {
+        mesh->info.cuda_save_dir = argv[++i]; i++; continue;
+      }
+      if ( !strcmp(argv[i],"-save-all") ) {
+        mesh->info.cuda_save_all = 1; i++; continue;
+      }
+      if ( !strcmp(argv[i],"-save-at") && i + 1 < argc ) {
+        { const char *sn[] = {"post-load","post-scale","post-analys","post-inqua",
+            "post-geom","post-defsiz","post-gradsiz","post-adapt","post-unscale"};
+          int si, found = 0; ++i;
+          for (si = 0; si < 9; ++si)
+            if (!strcmp(argv[i], sn[si])) { mesh->info.cuda_save_stage = (int8_t)si; found = 1; break; }
+          if (!found) { fprintf(stderr,"\nUnknown stage: %s\n",argv[i]); return 0; }
+        } i++; continue;
+      }
+      if ( !strcmp(argv[i],"-run-from") && i + 1 < argc ) {
+        { const char *sn[] = {"post-load","post-scale","post-analys","post-inqua",
+            "post-geom","post-defsiz","post-gradsiz","post-adapt","post-unscale"};
+          int si, found = 0; ++i;
+          for (si = 0; si < 9; ++si)
+            if (!strcmp(argv[i], sn[si])) { mesh->info.cuda_run_from = (int8_t)si; found = 1; break; }
+          if (!found) { fprintf(stderr,"\nUnknown stage: %s\n",argv[i]); return 0; }
+        } i++; continue;
+      }
+      if ( !strcmp(argv[i],"-run-to") && i + 1 < argc ) {
+        { const char *sn[] = {"post-load","post-scale","post-analys","post-inqua",
+            "post-geom","post-defsiz","post-gradsiz","post-adapt","post-unscale"};
+          int si, found = 0; ++i;
+          for (si = 0; si < 9; ++si)
+            if (!strcmp(argv[i], sn[si])) { mesh->info.cuda_run_to = (int8_t)si; found = 1; break; }
+          if (!found) { fprintf(stderr,"\nUnknown stage: %s\n",argv[i]); return 0; }
+        } i++; continue;
+      }
+      if ( !strcmp(argv[i],"-list-stages") ) {
+        const char *sn[] = {"post-load","post-scale","post-analys","post-inqua",
+          "post-geom","post-defsiz","post-gradsiz","post-adapt","post-unscale"};
+        int si;
+        fprintf(stdout,"Pipeline stages (mmgs):\n");
+        for (si = 0; si < 9; ++si) fprintf(stdout,"  %2d. %s\n", si, sn[si]);
+        exit(0);
+      }
+#endif /* WITH_CUDA */
+
       switch(argv[i][1]) {
       case 'a': /* ridge angle */
         if ( !strcmp(argv[i],"-ar") ) {

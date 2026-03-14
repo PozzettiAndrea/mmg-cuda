@@ -40,6 +40,10 @@
 #include "inlined_functions_3d_private.h"
 #include "mmg3dexterns_private.h"
 
+#ifdef WITH_CUDA
+#include "cuda/mmg3d_cuda.h"
+#endif
+
 /**
  * \param mesh pointer to the mesh structure.
  * \param met pointer to the metric structure.
@@ -466,6 +470,15 @@ int MMG5_mmg3d1_pattern(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
     return 0;
   }
 
+#ifdef WITH_CUDA
+  if (mesh->info.cuda_save_dir &&
+      (mesh->info.cuda_save_all ||
+       mesh->info.cuda_save_stage == (int8_t)MMG3D_STAGE_POST_DEFSIZ)) {
+    MMG3D_save_checkpoint(mesh, met, MMG3D_STAGE_POST_DEFSIZ,
+                          mesh->info.cuda_save_dir);
+  }
+#endif
+
   /* Debug: export variable MMG_SAVE_DEFSIZ to save adapted mesh at the end of
    * anatet wave */
   if ( getenv("MMG_SAVE_DEFSIZ") ) {
@@ -494,8 +507,33 @@ int MMG5_mmg3d1_pattern(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
     MMG3D_gradsizreq(mesh,met);
   }
 
-  /* update quality*/
-  if ( !MMG3D_tetraQual(mesh,met,1) ) return 0;
+#ifdef WITH_CUDA
+  if (mesh->info.cuda_save_dir &&
+      (mesh->info.cuda_save_all ||
+       mesh->info.cuda_save_stage == (int8_t)MMG3D_STAGE_POST_GRADSIZ)) {
+    MMG3D_save_checkpoint(mesh, met, MMG3D_STAGE_POST_GRADSIZ,
+                          mesh->info.cuda_save_dir);
+  }
+#endif
+
+  /* update quality — with strategy dispatch */
+#ifdef WITH_CUDA
+  if (mesh->info.quality_strategy == 1) {
+    if ( !MMG3D_tetraQual_cuda(mesh,met,1) ) return 0;
+  } else
+#endif
+  {
+    if ( !MMG3D_tetraQual(mesh,met,1) ) return 0;
+  }
+
+#ifdef WITH_CUDA
+  if (mesh->info.cuda_save_dir &&
+      (mesh->info.cuda_save_all ||
+       mesh->info.cuda_save_stage == (int8_t)MMG3D_STAGE_POST_QUAL2)) {
+    MMG3D_save_checkpoint(mesh, met, MMG3D_STAGE_POST_QUAL2,
+                          mesh->info.cuda_save_dir);
+  }
+#endif
 
   if ( !MMG5_anatet(mesh,met,2,1) ) {
     fprintf(stderr,"\n  ## Unable to split mesh. Exiting.\n");

@@ -107,6 +107,19 @@ void MMG5_Init_parameters(MMG5_pMesh mesh) {
    * scaleMesh function */
   mesh->info.lag      = MMG5_LAG;
 
+#ifdef WITH_CUDA
+  /* CUDA strategy defaults: all CPU */
+  mesh->info.quality_strategy   = 0;
+  mesh->info.metvol_strategy    = 0;
+  mesh->info.gradation_strategy = 0;
+  /* Checkpoint defaults: disabled */
+  mesh->info.cuda_save_dir   = NULL;
+  mesh->info.cuda_save_all   = 0;
+  mesh->info.cuda_save_stage = -1;
+  mesh->info.cuda_run_from   = -1;
+  mesh->info.cuda_run_to     = -1;
+#endif
+
   /* initial value for memMax and gap */
   mesh->gap = MMG5_GAP;
   mesh->memMax = MMG5_memSize();

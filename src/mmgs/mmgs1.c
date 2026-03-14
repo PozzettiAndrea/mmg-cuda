@@ -37,6 +37,16 @@
 #include "mmgexterns_private.h"
 #include "inlined_functions_private.h"
 
+#ifdef WITH_CUDA
+#include "cuda/mmgs_cuda.h"
+#include <sys/time.h>
+static double mmgs_wtime(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+#endif
+
 extern int8_t ddb;
 
 /**
@@ -593,6 +603,26 @@ static int anaelt(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
   if ( !MMG5_hashNew(mesh,&hash,mesh->np,3*mesh->np) ) return -1;
   ns = 0;
   s  = 0.5;
+
+#ifdef WITH_CUDA
+  /* GPU-accelerated edge marking for typchk==2 (metric-driven splitting).
+   * Batch-compute all edge lengths on GPU and set pt->flag before the
+   * point-creation loop. This replaces the per-edge MMG5_lenSurfEdg calls.
+   * Only beneficial for large meshes where GPU compute > transfer overhead. */
+  if (typchk == 2 && mesh->info.quality_strategy == 1 && mesh->nt > 500000) {
+    double _tmark0 = mmgs_wtime();
+    int gpu_ns = anaelt_gpu_mark(mesh, met);
+    double _tmark1 = mmgs_wtime();
+    if (gpu_ns < 0) {
+      MMG5_DEL_MEM(mesh, hash.item);
+      return -1;
+    }
+    fprintf(stdout, "[CUDA-MARK] GPU edge marking: %d tris flagged [%.1f ms]\n",
+            gpu_ns, (_tmark1 - _tmark0) * 1000.0);
+    /* Now pt->flag is already set for all triangles. Skip the CPU scan below. */
+  }
+#endif
+
   for (k=1; k<=mesh->nt; k++) {
     pt = &mesh->tria[k];
 
@@ -600,34 +630,46 @@ static int anaelt(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
       continue;
     }
 
-    pt->flag = 0;
-
-    if ( pt->ref < 0 ) {
-      continue;
+#ifdef WITH_CUDA
+    /* If GPU already marked edges (typchk==2), skip the CPU edge check */
+    if (typchk == 2 && mesh->info.quality_strategy == 1) {
+      if (pt->ref < 0) continue;
+      if (MS_SIN(pt->tag[0]) && MS_SIN(pt->tag[1]) && MS_SIN(pt->tag[2])) continue;
+      if (!pt->flag) continue;
+      ns++;
     }
+    else
+#endif
+    {
+      pt->flag = 0;
 
-    /* Required triangle */
-    if ( MS_SIN(pt->tag[0]) && MS_SIN(pt->tag[1]) && MS_SIN(pt->tag[2]) )  continue;
-
-    /* check element cut */
-    if ( typchk == 1 ) {
-      if ( !chkedg(mesh,k) )  continue;
-    }
-    else if ( typchk == 2 ) {
-      for (i=0; i<3; i++) {
-        if ( pt->tag[i] & MG_REQ) continue;
-
-        i1 = MMG5_inxt2[i];
-        i2 = MMG5_iprv2[i];
-        len = MMG5_lenSurfEdg(mesh,met,pt->v[i1],pt->v[i2],0);
-        if ( !len ) return -1;
-        else if ( len > MMGS_LLONG )  {
-          MG_SET(pt->flag,i);
-        }
+      if ( pt->ref < 0 ) {
+        continue;
       }
-      if ( !pt->flag )  continue;
+
+      /* Required triangle */
+      if ( MS_SIN(pt->tag[0]) && MS_SIN(pt->tag[1]) && MS_SIN(pt->tag[2]) )  continue;
+
+      /* check element cut */
+      if ( typchk == 1 ) {
+        if ( !chkedg(mesh,k) )  continue;
+      }
+      else if ( typchk == 2 ) {
+        for (i=0; i<3; i++) {
+          if ( pt->tag[i] & MG_REQ) continue;
+
+          i1 = MMG5_inxt2[i];
+          i2 = MMG5_iprv2[i];
+          len = MMG5_lenSurfEdg(mesh,met,pt->v[i1],pt->v[i2],0);
+          if ( !len ) return -1;
+          else if ( len > MMGS_LLONG )  {
+            MG_SET(pt->flag,i);
+          }
+        }
+        if ( !pt->flag )  continue;
+      }
+      ns++;
     }
-    ns++;
 
     /* geometric support */
     ier = MMG5_bezierCP(mesh,pt,&pb,1);
@@ -1268,6 +1310,162 @@ static MMG5_int adpcol(MMG5_pMesh mesh,MMG5_pSol met) {
 }
 
 
+#ifdef WITH_CUDA
+/**
+ * GPU-accelerated split: batch-compute all edge lengths on GPU,
+ * then CPU only processes candidates with len > LOPTL.
+ */
+static MMG5_int adpspl_cuda(MMG5_pMesh mesh, MMG5_pSol met) {
+  MMG5_pTria    pt;
+  MMG5_pPoint   p1,p2;
+  double        lmax;
+  int           ier;
+  MMG5_int      ip,ns,k;
+  int8_t        i,i1,i2,imax;
+  double        *edge_len = NULL;
+  int           *edge_mark = NULL;
+  int           nsplit_candidates = 0;
+
+  /* GPU batch edge length computation */
+  double _t0 = mmgs_wtime();
+  if (!MMGS_edgeLengths_cuda(mesh, met, &edge_len, &edge_mark,
+                              &nsplit_candidates, NULL)) {
+    /* Fallback to CPU */
+    return adpspl(mesh, met);
+  }
+  double _t1 = mmgs_wtime();
+
+  ns = 0;
+  /* Only iterate over triangles — use precomputed lengths */
+  for (k=1; k<=mesh->nt; k++) {
+    pt = &mesh->tria[k];
+    if ( !MG_EOK(pt) || pt->ref < 0 ) continue;
+
+    pt->flag = 0;
+    imax = -1;
+    lmax = -1.0;
+
+    /* Use GPU-precomputed edge lengths instead of calling lenSurfEdg */
+    for (i=0; i<3; i++) {
+      double len = edge_len[3*k+i];
+      if (len <= 0.0) { free(edge_len); free(edge_mark); return -1; }
+      if (len > lmax) { lmax = len; imax = i; }
+    }
+
+    if ( lmax < MMGS_LOPTL ) continue;
+    if ( MS_SIN(pt->tag[imax]) ) continue;
+
+    i1 = MMG5_inxt2[imax];
+    i2 = MMG5_iprv2[imax];
+    p1 = &mesh->point[pt->v[i1]];
+    p2 = &mesh->point[pt->v[i2]];
+    if ( p1->tag & MG_NOM || p2->tag & MG_NOM ) continue;
+
+    ip = chkspl(mesh,met,k,imax);
+    if ( ip < 0 ) { free(edge_len); free(edge_mark); return ns; }
+    else if ( ip > 0 ) {
+      ier = MMGS_simbulgept(mesh,met,k,imax,ip);
+      if ( !ier ) {
+        ier = MMGS_dichoto1b(mesh,met,k,imax,ip);
+        if ( !ier ) { MMGS_delPt(mesh,ip); continue; }
+      }
+      ier = split1b(mesh,k,imax,ip);
+      if ( !ier ) { MMGS_delPt(mesh,ip); free(edge_len); free(edge_mark); return ns; }
+      ns += ier;
+    }
+  }
+
+  fprintf(stdout, "[CUDA-SPL] GPU scan: %.1f ms, %d split candidates, %"
+          MMG5_PRId " applied\n",
+          (_t1-_t0)*1000.0, nsplit_candidates, ns);
+
+  free(edge_len);
+  free(edge_mark);
+  return ns;
+}
+
+/**
+ * GPU-accelerated collapse: batch-compute all edge lengths on GPU,
+ * then CPU only processes candidates with len < LOPTS.
+ */
+static MMG5_int adpcol_cuda(MMG5_pMesh mesh, MMG5_pSol met) {
+  MMG5_pTria    pt;
+  MMG5_pPoint   p1,p2;
+  MMG5_int      nc,k,list[MMG5_TRIA_LMAX+2];
+  int           ier,ilist;
+  int8_t        i,i1,i2;
+  double        *edge_len = NULL;
+  int           *edge_mark = NULL;
+  int           ncollapse_candidates = 0;
+
+  /* GPU batch edge length computation */
+  double _t0 = mmgs_wtime();
+  if (!MMGS_edgeLengths_cuda(mesh, met, &edge_len, &edge_mark,
+                              NULL, &ncollapse_candidates)) {
+    return adpcol(mesh, met);
+  }
+  double _t1 = mmgs_wtime();
+
+  nc = 0;
+  for (k=1; k<=mesh->nt; k++) {
+    pt = &mesh->tria[k];
+    if ( !MG_EOK(pt) || pt->ref < 0 ) continue;
+
+    pt->flag = 0;
+    for (i=0; i<3; i++) {
+      if ( MS_SIN(pt->tag[i]) ) continue;
+
+      i1 = MMG5_inxt2[i];
+      i2 = MMG5_iprv2[i];
+      p1 = &mesh->point[pt->v[i1]];
+      p2 = &mesh->point[pt->v[i2]];
+      if ( p1->tag & MG_NOM || p2->tag & MG_NOM ) continue;
+
+      /* Use GPU-precomputed edge length */
+      double len = edge_len[3*k+i];
+      if ( !len ) { free(edge_len); free(edge_mark); return -1; }
+      if ( len > MMGS_LOPTS ) continue;
+
+      p1 = &mesh->point[pt->v[i1]];
+      p2 = &mesh->point[pt->v[i2]];
+      if ( MS_SIN(p1->tag) ) continue;
+      else if ( p1->tag > p2->tag || p1->tag > pt->tag[i] ) continue;
+
+      ilist = chkcol(mesh,met,k,i,list,2,MMG5_lenSurfEdg,MMG5_calelt);
+
+      int8_t open = (mesh->adja[3*(k-1)+1+i] == 0);
+
+      if ( ilist+open > 3 ) {
+        ier = colver(mesh,list,ilist);
+        nc += ier;
+        if ( !ier ) { free(edge_len); free(edge_mark); return -1; }
+        break;
+      }
+      else if ( ilist == 3 ) {
+        ier = colver3(mesh,list);
+        nc += ier;
+        if ( !ier ) { free(edge_len); free(edge_mark); return -1; }
+        break;
+      }
+      else if ( ilist == 2 ) {
+        ier = colver2(mesh,list);
+        nc += ier;
+        if ( !ier ) { free(edge_len); free(edge_mark); return -1; }
+        break;
+      }
+    }
+  }
+
+  fprintf(stdout, "[CUDA-COL] GPU scan: %.1f ms, %d collapse candidates, %"
+          MMG5_PRId " applied\n",
+          (_t1-_t0)*1000.0, ncollapse_candidates, nc);
+
+  free(edge_len);
+  free(edge_mark);
+  return nc;
+}
+#endif /* WITH_CUDA */
+
 /* analyze triangles and split or collapse to match gradation */
 static int adptri(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int* permNodGlob) {
   int         it,maxit;
@@ -1279,6 +1477,11 @@ static int adptri(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int* permNodGlob) {
   maxit = 10;
   do {
     if ( !mesh->info.noinsert ) {
+      /* NOTE: GPU batch scan of edge lengths is not used here because the
+       * sequential nature of split/collapse (each operation changes the mesh
+       * for subsequent operations) makes precomputed lengths stale.
+       * The real GPU win requires porting the full split/collapse pass to GPU
+       * with conflict resolution, as done in QuadriFlow-cuda's subdivide_gpu.cu. */
       ns = adpspl(mesh,met);
       if ( ns < 0 ) {
         fprintf(stderr,"\n  ## Unable to complete mesh. Exit program.\n");
@@ -1385,6 +1588,51 @@ static int adptri(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int* permNodGlob) {
   return 1;
 }
 
+#ifdef WITH_CUDA
+/**
+ * GPU-accelerated edge marking for anaelt (typchk==2 only).
+ * Batch-computes all edge lengths on GPU, sets pt->flag for edges > MMGS_LLONG.
+ * Returns number of triangles with at least one flagged edge, or -1 on failure.
+ */
+int anaelt_gpu_mark(MMG5_pMesh mesh, MMG5_pSol met) {
+  double *edge_len = NULL;
+  int *edge_mark = NULL;
+  MMG5_int k, ns;
+  int8_t i;
+
+  /* Use the GPU edge length kernel with LLONG threshold */
+  if (!MMGS_edgeLengths_cuda(mesh, met, &edge_len, &edge_mark, NULL, NULL)) {
+    return -1;
+  }
+
+  /* Apply the GPU-computed marks to pt->flag */
+  ns = 0;
+  for (k = 1; k <= mesh->nt; k++) {
+    MMG5_pTria pt = &mesh->tria[k];
+    if (!MG_EOK(pt) || pt->ref < 0) continue;
+
+    pt->flag = 0;
+
+    /* Required triangle */
+    if (MS_SIN(pt->tag[0]) && MS_SIN(pt->tag[1]) && MS_SIN(pt->tag[2])) continue;
+
+    for (i = 0; i < 3; i++) {
+      if (pt->tag[i] & MG_REQ) continue;
+      double len = edge_len[3*k + i];
+      if (!len) { free(edge_len); free(edge_mark); return -1; }
+      if (len > MMGS_LLONG) {
+        MG_SET(pt->flag, i);
+      }
+    }
+    if (pt->flag) ns++;
+  }
+
+  free(edge_len);
+  free(edge_mark);
+  return ns;
+}
+#endif
+
 /* analyze tetrahedra and split if needed */
 static int anatri(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
   MMG5_int     nc,ns,nf,nnc,nns,nnf;
@@ -1460,6 +1708,9 @@ static int anatri(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
  *
  */
 int MMG5_mmgs1(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
+#ifdef WITH_CUDA
+  double _t0, _t1;
+#endif
 
   /* renumbering if available */
   if ( abs(mesh->info.imprim) > 4 )
@@ -1469,10 +1720,26 @@ int MMG5_mmgs1(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
   if ( abs(mesh->info.imprim) > 4 || mesh->info.ddebug )
     fprintf(stdout,"  ** GEOMETRIC MESH\n");
 
+#ifdef WITH_CUDA
+  _t0 = mmgs_wtime();
+#endif
+
   if ( !anatri(mesh,met,1) ) {
     fprintf(stderr,"\n  ## Unable to split mesh-> Exiting.\n");
     return 0;
   }
+
+#ifdef WITH_CUDA
+  _t1 = mmgs_wtime();
+  fprintf(stdout,"[TIMING-S] anatri(geom):  %.3f s\n", _t1 - _t0);
+
+  if (mesh->info.cuda_save_dir &&
+      (mesh->info.cuda_save_all ||
+       mesh->info.cuda_save_stage == (int8_t)MMGS_STAGE_POST_GEOM)) {
+    MMGS_save_checkpoint(mesh, met, MMGS_STAGE_POST_GEOM,
+                         mesh->info.cuda_save_dir);
+  }
+#endif
 
   /* Debug: export variable MMG_SAVE_ANATRI1 to save adapted mesh at the end of
    * anatri wave */
@@ -1491,10 +1758,26 @@ int MMG5_mmgs1(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
     fprintf(stdout,"  ** COMPUTATIONAL MESH\n");
 
   /* define metric map */
+#ifdef WITH_CUDA
+  _t0 = mmgs_wtime();
+#endif
+
   if ( !MMGS_defsiz(mesh,met) ) {
     fprintf(stderr,"\n  ## Metric undefined. Exit program.\n");
     return 0;
   }
+
+#ifdef WITH_CUDA
+  _t1 = mmgs_wtime();
+  fprintf(stdout,"[TIMING-S] defsiz:       %.3f s\n", _t1 - _t0);
+
+  if (mesh->info.cuda_save_dir &&
+      (mesh->info.cuda_save_all ||
+       mesh->info.cuda_save_stage == (int8_t)MMGS_STAGE_POST_DEFSIZ)) {
+    MMGS_save_checkpoint(mesh, met, MMGS_STAGE_POST_DEFSIZ,
+                         mesh->info.cuda_save_dir);
+  }
+#endif
 
  /* Debug: export variable MMG_SAVE_DEFSIZ to save adapted mesh at the end of
    * anatet wave */
@@ -1505,6 +1788,11 @@ int MMG5_mmgs1(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
   }
 
   MMG5_gradation_info(mesh);
+
+#ifdef WITH_CUDA
+  _t0 = mmgs_wtime();
+#endif
+
   if ( mesh->info.hgrad > 0. ) {
      if (!MMGS_gradsiz(mesh,met) ) {
       fprintf(stderr,"\n  ## Gradation problem. Exit program.\n");
@@ -1516,6 +1804,18 @@ int MMG5_mmgs1(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
     MMGS_gradsizreq(mesh,met);
   }
 
+#ifdef WITH_CUDA
+  _t1 = mmgs_wtime();
+  fprintf(stdout,"[TIMING-S] gradsiz:      %.3f s\n", _t1 - _t0);
+
+  if (mesh->info.cuda_save_dir &&
+      (mesh->info.cuda_save_all ||
+       mesh->info.cuda_save_stage == (int8_t)MMGS_STAGE_POST_GRADSIZ)) {
+    MMGS_save_checkpoint(mesh, met, MMGS_STAGE_POST_GRADSIZ,
+                         mesh->info.cuda_save_dir);
+  }
+#endif
+
   /* Debug: export variable MMG_SAVE_GRADSIZ to save adapted mesh at the end of
    * anatet wave */
   if ( getenv("MMG_SAVE_GRADSIZ") ) {
@@ -1524,10 +1824,20 @@ int MMG5_mmgs1(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
     return 1;
   }
 
+#ifdef WITH_CUDA
+  _t0 = mmgs_wtime();
+#endif
+
   if ( !anatri(mesh,met,2) ) {
     fprintf(stderr,"\n  ## Unable to proceed adaptation. Exit program.\n");
     return 0;
   }
+
+#ifdef WITH_CUDA
+  _t1 = mmgs_wtime();
+  fprintf(stdout,"[TIMING-S] anatri(comp):  %.3f s\n", _t1 - _t0);
+#endif
+
   /* Debug: export variable MMG_SAVE_ANATRI1 to save adapted mesh at the end of
    * anatri wave */
   if ( getenv("MMG_SAVE_ANATRI2") ) {
@@ -1540,10 +1850,19 @@ int MMG5_mmgs1(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int *permNodGlob) {
   if ( !MMG5_scotchCall(mesh,met,NULL,permNodGlob) )
     return 0;
 
+#ifdef WITH_CUDA
+  _t0 = mmgs_wtime();
+#endif
+
   if ( !adptri(mesh,met,permNodGlob) ) {
     fprintf(stderr,"\n  ## Unable to adapt. Exit program.\n");
     return 0;
   }
+
+#ifdef WITH_CUDA
+  _t1 = mmgs_wtime();
+  fprintf(stdout,"[TIMING-S] adptri:       %.3f s\n", _t1 - _t0);
+#endif
 
   return 1;
 }

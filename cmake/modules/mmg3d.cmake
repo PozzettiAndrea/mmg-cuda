@@ -87,6 +87,26 @@ IF ( VTK_FOUND AND NOT USE_VTK MATCHES OFF )
     ${MMGCOMMON_SOURCE_DIR}/vtkparser.cpp)
 ENDIF ( )
 
+# CUDA acceleration sources
+IF ( BUILD_CUDA )
+  FILE(
+    GLOB
+    mmg3d_cuda_c_files
+    ${MMG3D_SOURCE_DIR}/cuda/*.c
+    ${MMG3D_SOURCE_DIR}/cuda/*.h
+    )
+  FILE(
+    GLOB
+    mmg3d_cuda_cu_files
+    ${MMG3D_SOURCE_DIR}/cuda/*.cu
+    )
+  LIST(APPEND mmg3d_library_files ${mmg3d_cuda_c_files})
+  IF ( mmg3d_cuda_cu_files )
+    LIST(APPEND mmg3d_library_files ${mmg3d_cuda_cu_files})
+    SET_SOURCE_FILES_PROPERTIES(${mmg3d_cuda_cu_files} PROPERTIES LANGUAGE CUDA)
+  ENDIF()
+ENDIF()
+
 FILE(
   GLOB
   mmg3d_main_file
@@ -125,12 +145,20 @@ ENDIF()
 IF ( LIBMMG3D_STATIC )
   ADD_AND_INSTALL_LIBRARY ( lib${PROJECT_NAME}3d_a STATIC copy_3d_headers
     "${mmg3d_library_files}" ${PROJECT_NAME}3d )
+  IF ( BUILD_CUDA )
+    SET_TARGET_PROPERTIES(lib${PROJECT_NAME}3d_a PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    TARGET_LINK_LIBRARIES(lib${PROJECT_NAME}3d_a PRIVATE CUDA::cudart)
+  ENDIF()
 ENDIF()
 
 # Compile shared library
 IF ( LIBMMG3D_SHARED )
   ADD_AND_INSTALL_LIBRARY ( lib${PROJECT_NAME}3d_so SHARED copy_3d_headers
     "${mmg3d_library_files}" ${PROJECT_NAME}3d )
+  IF ( BUILD_CUDA )
+    SET_TARGET_PROPERTIES(lib${PROJECT_NAME}3d_so PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    TARGET_LINK_LIBRARIES(lib${PROJECT_NAME}3d_so PRIVATE CUDA::cudart)
+  ENDIF()
 ENDIF()
 
 # mmg3d header files needed for library

@@ -31,6 +31,24 @@ INCLUDE(CMakeDependentOption)
 
 PROJECT (mmg)
 
+###############################################################################
+#####
+#####         CUDA support
+#####
+###############################################################################
+OPTION(BUILD_CUDA "Enable CUDA acceleration for mmg3d" OFF)
+
+IF (BUILD_CUDA)
+  ENABLE_LANGUAGE(CUDA)
+  FIND_PACKAGE(CUDAToolkit REQUIRED)
+  SET(CMAKE_CUDA_STANDARD 11)
+  IF (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    SET(CMAKE_CUDA_ARCHITECTURES "86")
+  ENDIF()
+  ADD_DEFINITIONS(-DWITH_CUDA)
+  MESSAGE(STATUS "CUDA acceleration enabled (SM ${CMAKE_CUDA_ARCHITECTURES})")
+ENDIF()
+
 LIST(APPEND CMAKE_MODULE_PATH
   ${PROJECT_SOURCE_DIR}/cmake/modules
   ${PROJECT_SOURCE_DIR}/cmake/testing )

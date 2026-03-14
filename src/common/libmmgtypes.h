@@ -561,6 +561,20 @@ typedef struct {
 
   MMG5_pMat     mat;
   MMG5_InvMat   invmat;
+
+#ifdef WITH_CUDA
+  /* Strategy flags: 0=cpu (default), 1=cuda */
+  int8_t        quality_strategy;   /*!< MMG3D_tetraQual strategy */
+  int8_t        metvol_strategy;    /*!< MMG5_defmetvol strategy */
+  int8_t        gradation_strategy; /*!< MMG3D_gradsiz_ani strategy */
+
+  /* Checkpoint control */
+  char          *cuda_save_dir;     /*!< checkpoint directory */
+  int8_t        cuda_save_all;      /*!< save at every stage boundary */
+  int8_t        cuda_save_stage;    /*!< specific stage to save at (-1=none) */
+  int8_t        cuda_run_from;      /*!< stage to resume from (-1=start) */
+  int8_t        cuda_run_to;        /*!< stage to stop at (-1=end) */
+#endif
 } MMG5_Info;
 
 /**
