@@ -1647,6 +1647,34 @@ static int anatri(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
       MMG5_DEL_MEM(mesh,mesh->adja);
       mesh->adja = 0;
 
+#ifdef WITH_CUDA
+      /* GPU-resident parallel split pass for metric-driven splitting (typchk==2).
+       * This replaces the sequential anaelt scan+split with a fully parallel
+       * pipeline: mark → dedup → midpoints → prefix scan → parallel apply → E2E rebuild.
+       * Only for typchk==2 (metric-driven) since typchk==1 needs Bezier interpolation. */
+      if (typchk == 2 && mesh->info.quality_strategy == 1) {
+        double _tgpu0 = mmgs_wtime();
+        int gpu_ns = MMGS_gpu_split_pass(mesh, met);
+        double _tgpu1 = mmgs_wtime();
+        if (gpu_ns > 0) {
+          fprintf(stdout, "[GPU-SPLIT] anatri pass %d: %d splits [%.1f ms]\n",
+                  it, gpu_ns, (_tgpu1-_tgpu0)*1000.0);
+          /* Rebuild hash after GPU splits */
+          if (!MMGS_hashTria(mesh)) {
+            fprintf(stderr,"\n  ## Hashing problem after GPU split.\n");
+            return 0;
+          }
+          ns = gpu_ns;
+          nns += ns;
+          /* Skip CPU anaelt — GPU already did the splits */
+          goto anatri_post_split;
+        } else if (gpu_ns < 0) {
+          fprintf(stderr,"\n  ## GPU split failed, falling back to CPU.\n");
+        }
+        /* gpu_ns == 0 → no splits needed, fall through to CPU path */
+      }
+#endif
+
       /* analyze surface */
       ns = anaelt(mesh,met,typchk);
       if ( ns < 0 ) {
@@ -1659,6 +1687,9 @@ static int anatri(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
         return 0;
       }
 
+#ifdef WITH_CUDA
+    anatri_post_split:
+#endif
       /* collapse short edges */
       nc = colelt(mesh,met,typchk);
       if ( nc < 0 ) {

@@ -133,6 +133,15 @@ int MMGS_edgeLengths_cuda(MMG5_pMesh mesh, MMG5_pSol met,
                           double **out_edge_len, int **out_edge_mark,
                           int *out_nsplit, int *out_ncollapse);
 
+/**
+ * GPU-resident parallel split pass for anatri(comp).
+ * Marks long edges, creates midpoints, applies splits, rebuilds adjacency —
+ * all on GPU with single upload/download.
+ *
+ * \return number of splits performed, 0 if none needed, -1 on error.
+ */
+int MMGS_gpu_split_pass(MMG5_pMesh mesh, MMG5_pSol met);
+
 #endif /* WITH_CUDA */
 
 #ifdef __cplusplus
