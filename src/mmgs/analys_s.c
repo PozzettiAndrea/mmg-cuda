@@ -1093,57 +1093,80 @@ int MMGS_analys_for_norver(MMG5_pMesh mesh) {
 /* preprocessing stage: mesh analysis */
 int MMGS_analys(MMG5_pMesh mesh) {
 
+#ifdef WITH_CUDA
+#include <sys/time.h>
+  struct timeval _tv0, _tv1;
+#define ATICK gettimeofday(&_tv0, NULL)
+#define ATOCK(name) do { gettimeofday(&_tv1, NULL); \
+  fprintf(stdout, "[ANALYS]   %-20s %.3f ms\n", name, \
+    (_tv1.tv_sec-_tv0.tv_sec)*1000.0 + (_tv1.tv_usec-_tv0.tv_usec)/1000.0); } while(0)
+#else
+#define ATICK
+#define ATOCK(name)
+#endif
+
+  ATICK;
   /* Update tags stored into tria */
   if ( !MMGS_bdryUpdate(mesh) ) {
     fprintf(stderr,"\n  ## Analysis problem. Exit program.\n");
     return 0;
   }
+  ATOCK("bdryUpdate");
 
+  ATICK;
   /* set edges tags and refs to tria */
   if ( !MMGS_assignEdge(mesh) ) {
     fprintf(stderr,"\n  ## Analysis problem. Exit program.\n");
     return 0;
   }
+  ATOCK("assignEdge");
 
+  ATICK;
   /* create adjacency */
   if ( !MMGS_hashTria(mesh) ) {
     fprintf(stderr,"\n  ## Hashing problem. Exit program.\n");
     return 0;
   }
+  ATOCK("hashTria");
 
-  /* delete badly shaped elts */
-  /*if ( mesh->info.badkal && !delbad(mesh) ) {
-    fprintf(stderr,"\n  ## Geometry trouble. Exit program.\n");
-    return 0;
-    }*/
-
+  ATICK;
   /* identify connexity */
   if ( !MMGS_setadj(mesh) ) {
     fprintf(stderr,"\n  ## Topology problem. Exit program.\n");
     return 0;
   }
+  ATOCK("setadj");
 
+  ATICK;
   /* check for nomanifold point */
   nmpoints(mesh);
+  ATOCK("nmpoints");
 
+  ATICK;
   /* check for ridges */
   if ( mesh->info.dhd > MMG5_ANGLIM && !setdhd(mesh) ) {
     fprintf(stderr,"\n  ## Geometry problem. Exit program.\n");
     return 0;
   }
+  ATOCK("setdhd");
 
+  ATICK;
   /* identify singularities */
   if ( !MMG5_singul(mesh) ) {
     fprintf(stderr,"\n  ## Singularity problem. Exit program.\n");
     return 0;
   }
+  ATOCK("singul");
 
+  ATICK;
   /* regularize vertices coordinates */
   if ( mesh->info.xreg && !MMGS_regver(mesh) ){
     fprintf(stderr,"\n  ## Coordinates regularization problem. Exit program.\n");
     return 0;
   }
+  ATOCK("regver");
 
+  ATICK;
   /* define normals */
   if ( !mesh->xp ) {
     if ( !norver(mesh) ) {
@@ -1156,7 +1179,10 @@ int MMGS_analys(MMG5_pMesh mesh) {
       return 0;
     }
   }
+  ATOCK("norver+regnor");
 
+#undef ATICK
+#undef ATOCK
   return 1;
 }
 
