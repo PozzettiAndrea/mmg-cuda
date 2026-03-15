@@ -124,22 +124,24 @@ IF ( BUILD_RXMESH )
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
   )
 
-  # Standalone test executable for RXMesh aniso remeshing
-  # Usage: ./rxmesh_aniso_remesh input.obj [target_len] [num_iter]
+  # Standalone test — exactly mirrors pyrxmesh's build pattern:
+  # single .cu file compiled with CUDA_SEPARABLE_COMPILATION + CUDA_RESOLVE_DEVICE_SYMBOLS,
+  # linked against RXMesh static lib, includes RXMesh/apps/ for remesh headers.
   ADD_EXECUTABLE(rxmesh_aniso_remesh
     ${MMGS_SOURCE_DIR}/cuda/rxmesh_remesh/standalone_test.cu
-  )
-  TARGET_INCLUDE_DIRECTORIES(rxmesh_aniso_remesh PRIVATE
-    ${RXMESH_SOURCE_DIR}/include
-    ${RXMESH_SOURCE_DIR}/external
-    ${RXMESH_SOURCE_DIR}/external/glm
-    ${MMGS_SOURCE_DIR}/cuda/rxmesh_remesh
   )
   TARGET_LINK_LIBRARIES(rxmesh_aniso_remesh PRIVATE RXMesh CUDA::cudart)
   SET_TARGET_PROPERTIES(rxmesh_aniso_remesh PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  TARGET_COMPILE_OPTIONS(rxmesh_aniso_remesh PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr --diag-suppress=174,114>
+  )
+  TARGET_INCLUDE_DIRECTORIES(rxmesh_aniso_remesh PRIVATE
+    ${MMGS_SOURCE_DIR}/cuda/rxmesh_remesh
+    ${PROJECT_SOURCE_DIR}/RXMesh/apps
   )
 ENDIF()
 

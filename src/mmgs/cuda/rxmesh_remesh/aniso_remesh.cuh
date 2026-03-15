@@ -14,10 +14,8 @@
 #include "rxmesh/util/util.h"
 
 #include "aniso_metric.cuh"
-
-/* Edge status enum */
-using EdgeStatus = int8_t;
-enum : EdgeStatus { UNSEEN = 0, SKIP = 1, UPDATE = 2, ADDED = 3 };
+#include "aniso_split.cuh"
+#include "aniso_collapse.cuh"
 
 /**
  * Configuration for anisotropic remeshing.

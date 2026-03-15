@@ -13,16 +13,16 @@
 
 #include "rxmesh/rxmesh_dynamic.h"
 
-/* Forward declare the aniso remesh headers — they need __device__ compilation */
-#include "aniso_split.cuh"
-#include "aniso_collapse.cuh"
+/* RXMesh aniso remesh kernels */
 #include "aniso_remesh.cuh"
 
+/* mmg headers — included after RXMesh to avoid conflicts */
 extern "C" {
-
 #include "mmgcommon_private.h"
 #include "libmmgs_private.h"
-#include "cuda/mmgs_cuda.h"
+}
+
+extern "C" {
 
 /**
  * GPU anisotropic remeshing via RXMesh.

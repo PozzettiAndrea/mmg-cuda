@@ -1,75 +1,65 @@
-/**
- * \file standalone_test.cu
- * \brief Standalone test for RXMesh-based GPU anisotropic remeshing.
- *
- * Usage: rxmesh_aniso_remesh input.obj [target_len_ratio] [num_iter]
- *
- * Loads an OBJ mesh, runs GPU remeshing, saves result.
- * No mmg dependency — uses RXMesh directly.
- */
-
+/* Mirrors pyrxmesh/src/op_remesh.cu pattern exactly */
 #include <cstdio>
-#include <cstdlib>
 #include <string>
+#include <vector>
+#include <filesystem>
 
-#include "rxmesh/rxmesh_dynamic.h"
+#include "rxmesh/util/log.h"
+#include "rxmesh/util/macros.h"
 #include "rxmesh/util/util.h"
 
-/* Include the remesh kernels */
-#include "aniso_metric.cuh"
+#include "glm_compat.h"
 
-/* We need EdgeStatus from the split/collapse headers */
-using EdgeStatus = int8_t;
-enum : EdgeStatus { UNSEEN = 0, SKIP = 1, UPDATE = 2, ADDED = 3 };
+using namespace rxmesh;
 
-/* Include the actual remesh app from RXMesh — for now use isotropic as baseline */
-/* We'll swap in our aniso kernels once the build works */
+static char* s_argv[] = {(char*)"test", nullptr};
+static struct arg {
+    std::string obj_file_name;
+    std::string output_folder = "/tmp";
+    uint32_t    nx = 66;
+    uint32_t    ny = 66;
+    float       relative_len = 1.0f;
+    int         num_smooth_iters = 5;
+    uint32_t    num_iter = 3;
+    uint32_t    device_id = 0;
+    char**      argv = s_argv;
+    int         argc = 1;
+} Arg;
 
-int main(int argc, char** argv)
-{
-    using namespace rxmesh;
+#include "Remesh/remesh_rxmesh.cuh"
 
-    fprintf(stderr, "[RXMESH-TEST] main() entered\n");
-    fflush(stderr);
-
+int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s input.obj [target_len_ratio] [num_iter]\n", argv[0]);
+        fprintf(stderr, "Usage: %s input.obj [relative_len] [iterations]\n", argv[0]);
         return 1;
     }
 
-    std::string input_obj = argv[1];
-    float target_ratio = (argc > 2) ? atof(argv[2]) : 0.5f;
-    int num_iter = (argc > 3) ? atoi(argv[3]) : 3;
+    std::string input = argv[1];
+    Arg.obj_file_name = input;
+    if (argc > 2) Arg.relative_len = atof(argv[2]);
+    if (argc > 3) Arg.num_iter = atoi(argv[3]);
 
-    fprintf(stderr, "[RXMESH-TEST] About to load OBJ...\n");
-    fflush(stderr);
-    fprintf(stdout, "[RXMESH-TEST] Loading %s\n", input_obj.c_str());
-    fflush(stdout);
+    fprintf(stderr, "[TEST] Loading %s, rel_len=%.2f, iters=%d\n",
+            input.c_str(), Arg.relative_len, Arg.num_iter);
 
-    /* Create RXMeshDynamic */
-    RXMeshDynamic rx(input_obj, "", 512, 2.0, 2);
+    RXMeshDynamic rx(input, "", 512, 2.0f, 2);
 
-    fprintf(stdout, "[RXMESH-TEST] Loaded: %d verts, %d edges, %d faces, %d patches\n",
+    fprintf(stderr, "[TEST] Loaded: V=%d E=%d F=%d P=%d\n",
             rx.get_num_vertices(), rx.get_num_edges(),
             rx.get_num_faces(), rx.get_num_patches());
 
     if (!rx.is_edge_manifold()) {
-        fprintf(stderr, "[RXMESH-TEST] ERROR: mesh is not edge-manifold\n");
+        fprintf(stderr, "[TEST] Not edge-manifold!\n");
         return 1;
     }
 
+    remesh_rxmesh(rx);
+
     auto coords = rx.get_input_vertex_coordinates();
+    std::string outpath = "/tmp/rxmesh_remesh_out.obj";
+    rx.export_obj(outpath, *coords);
 
-    fprintf(stdout, "[RXMESH-TEST] Target ratio = %.4f, num_iter = %d\n",
-            target_ratio, num_iter);
-
-    /* TODO: run aniso_remesh_rxmesh here */
-    fprintf(stdout, "[RXMESH-TEST] GPU remesh not yet wired — just testing build\n");
-
-    /* Export result */
-    std::string output = "/tmp/rxmesh_test_out.obj";
-    rx.export_obj(output, *coords);
-    fprintf(stdout, "[RXMESH-TEST] Saved %s\n", output.c_str());
-
+    fprintf(stderr, "[TEST] Output: V=%d F=%d → %s\n",
+            rx.get_num_vertices(), rx.get_num_faces(), outpath.c_str());
     return 0;
 }
