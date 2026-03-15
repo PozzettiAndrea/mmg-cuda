@@ -1652,7 +1652,7 @@ static int anatri(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
        * This replaces the sequential anaelt scan+split with a fully parallel
        * pipeline: mark → dedup → midpoints → prefix scan → parallel apply → E2E rebuild.
        * Only for typchk==2 (metric-driven) since typchk==1 needs Bezier interpolation. */
-      if (typchk == 2 && mesh->info.quality_strategy == 1) {
+      if (typchk == 2 && mesh->info.quality_strategy == 1 && 0) { /* GPU full split disabled — writeback bug on dragon. GPU marking (below) still active. */
         double _tgpu0 = mmgs_wtime();
         int gpu_ns = MMGS_gpu_split_pass(mesh, met);
         double _tgpu1 = mmgs_wtime();

@@ -256,7 +256,152 @@ __global__ void ks_assign_midpoints(
 }
 
 /* ================================================================
- * Kernel 6: Count new triangles per parent triangle
+ * Kernel 6b: Validate splits — reject if resulting triangles degenerate
+ *
+ * For each marked edge, compute the two child triangles that would
+ * result from splitting. Check that both have:
+ *   1. Same orientation as parent (positive dot product of normals)
+ *   2. Sufficient quality (area/perimeter ratio above threshold)
+ *
+ * Invalid splits get their edge_mark and tri_flag cleared.
+ * ================================================================ */
+#define MMGS_MIN_SPLIT_QUAL 1.0e-6
+
+__device__ double device_tri_area_sign(
+    const double *a, const double *b, const double *c,
+    const double *ref_normal)
+{
+  /* Cross product (b-a) × (c-a) */
+  double abx = b[0]-a[0], aby = b[1]-a[1], abz = b[2]-a[2];
+  double acx = c[0]-a[0], acy = c[1]-a[1], acz = c[2]-a[2];
+  double nx = aby*acz - abz*acy;
+  double ny = abz*acx - abx*acz;
+  double nz = abx*acy - aby*acx;
+
+  /* Signed area relative to reference normal */
+  double dot = nx*ref_normal[0] + ny*ref_normal[1] + nz*ref_normal[2];
+  return dot;
+}
+
+__device__ double device_tri_quality(
+    const double *a, const double *b, const double *c)
+{
+  double abx = b[0]-a[0], aby = b[1]-a[1], abz = b[2]-a[2];
+  double acx = c[0]-a[0], acy = c[1]-a[1], acz = c[2]-a[2];
+  double bcx = c[0]-b[0], bcy = c[1]-b[1], bcz = c[2]-b[2];
+
+  double nx = aby*acz - abz*acy;
+  double ny = abz*acx - abx*acz;
+  double nz = abx*acy - aby*acx;
+  double area = sqrt(nx*nx + ny*ny + nz*nz);
+
+  double l2 = (abx*abx+aby*aby+abz*abz) +
+              (acx*acx+acy*acy+acz*acz) +
+              (bcx*bcx+bcy*bcy+bcz*bcz);
+  if (l2 < 1e-30) return 0.0;
+  return area / l2;
+}
+
+__global__ void ks_validate_splits(
+    const double *coords,
+    const int    *tri_v,
+    const int    *tri_valid,
+    int          *edge_marks,  /* modified: cleared for invalid splits */
+    int          *tri_flag,    /* modified: cleared for invalid splits */
+    const int    *vx_map,      /* midpoint vertex index per half-edge */
+    int           nt)
+{
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int k = idx / 3 + 1;
+  int i = idx % 3;
+  if (k > nt) return;
+  if (!tri_valid[k] || !edge_marks[3*k+i]) return;
+
+  int vx = vx_map[3*k+i];
+  if (vx <= 0) { edge_marks[3*k+i] = 0; return; }
+
+  static const int inxt2[6] = {1,2,0,1,2,0};
+  static const int iprv2[3] = {2,0,1};
+  int i1 = inxt2[i];
+  int i2 = iprv2[i];
+
+  int va = tri_v[3*k+0], vb = tri_v[3*k+1], vc = tri_v[3*k+2];
+  const double *pa = &coords[3*va];
+  const double *pb = &coords[3*vb];
+  const double *pc = &coords[3*vc];
+  const double *pm = &coords[3*vx];  /* midpoint */
+
+  /* Parent triangle normal (reference orientation) */
+  double abx = pb[0]-pa[0], aby = pb[1]-pa[1], abz = pb[2]-pa[2];
+  double acx = pc[0]-pa[0], acy = pc[1]-pa[1], acz = pc[2]-pa[2];
+  double ref_n[3];
+  ref_n[0] = aby*acz - abz*acy;
+  ref_n[1] = abz*acx - abx*acz;
+  ref_n[2] = abx*acy - aby*acx;
+  double ref_area = sqrt(ref_n[0]*ref_n[0] + ref_n[1]*ref_n[1] + ref_n[2]*ref_n[2]);
+  if (ref_area < 1e-30) { edge_marks[3*k+i] = 0; return; }
+
+  /* Child triangle 1: parent with v[i2] replaced by midpoint vx
+   * Vertices: v[0..2] with v[i2]=vx */
+  double child1_v[3][3];
+  for (int d = 0; d < 3; d++) {
+    child1_v[0][d] = (0 == i2) ? pm[d] : pa[d];
+    child1_v[1][d] = (1 == i2) ? pm[d] : pb[d];
+    child1_v[2][d] = (2 == i2) ? pm[d] : pc[d];
+  }
+
+  /* Child triangle 2: new tri with v[i1] replaced by midpoint vx */
+  double child2_v[3][3];
+  for (int d = 0; d < 3; d++) {
+    child2_v[0][d] = (0 == i1) ? pm[d] : pa[d];
+    child2_v[1][d] = (1 == i1) ? pm[d] : pb[d];
+    child2_v[2][d] = (2 == i1) ? pm[d] : pc[d];
+  }
+
+  /* Check orientation: both children must have same orientation as parent */
+  double dot1 = device_tri_area_sign(child1_v[0], child1_v[1], child1_v[2], ref_n);
+  double dot2 = device_tri_area_sign(child2_v[0], child2_v[1], child2_v[2], ref_n);
+
+  if (dot1 <= 0.0 || dot2 <= 0.0) {
+    edge_marks[3*k+i] = 0;
+    /* Also need to clear the corresponding bit in tri_flag */
+    atomicAnd(&tri_flag[k], ~(1 << i));
+    return;
+  }
+
+  /* Check quality: both children must have reasonable quality */
+  double q1 = device_tri_quality(child1_v[0], child1_v[1], child1_v[2]);
+  double q2 = device_tri_quality(child2_v[0], child2_v[1], child2_v[2]);
+
+  if (q1 < MMGS_MIN_SPLIT_QUAL || q2 < MMGS_MIN_SPLIT_QUAL) {
+    edge_marks[3*k+i] = 0;
+    atomicAnd(&tri_flag[k], ~(1 << i));
+    return;
+  }
+}
+
+/* ================================================================
+ * Kernel 6c: Recount marked edges after validation
+ * Recomputes tri_flag from validated edge_marks
+ * ================================================================ */
+__global__ void ks_recount_flags(
+    const int *edge_marks,
+    int       *tri_flag,
+    const int *tri_valid,
+    int        nt)
+{
+  int k = blockIdx.x * blockDim.x + threadIdx.x + 1;
+  if (k > nt || !tri_valid[k]) return;
+
+  int flag = 0;
+  if (edge_marks[3*k+0]) flag |= 1;
+  if (edge_marks[3*k+1]) flag |= 2;
+  if (edge_marks[3*k+2]) flag |= 4;
+  tri_flag[k] = flag;
+}
+
+/* ================================================================
+ * Kernel 7: Count new triangles per parent triangle
  * flag=1,2,4 → +1 new tri; flag=3,5,6 → +2; flag=7 → +3
  * ================================================================ */
 __global__ void ks_count_new_tris(
@@ -617,6 +762,32 @@ int MMGS_gpu_split_pass(MMG5_pMesh mesh, MMG5_pSol met) {
         d_tri_v, d_edge_marks, d_tri_valid, nT_cur, maxV, nV_cur,
         d_vx_map);
 
+    /* Step 6b: Validate splits — reject those creating degenerate tris */
+    ks_validate_splits<<<numBlocks_e, BS>>>(
+        d_coords, d_tri_v, d_tri_valid,
+        d_edge_marks, d_tri_flag, d_vx_map, nT_cur);
+
+    /* Step 6c: Recount flags after validation */
+    ks_recount_flags<<<numBlocks_t, BS>>>(
+        d_edge_marks, d_tri_flag, d_tri_valid, nT_cur);
+
+    /* Recount new tris after validation may have rejected some */
+    ks_count_new_tris<<<numBlocks_t, BS>>>(
+        d_tri_flag, d_tri_valid, nT_cur, d_tri_new_count);
+
+    {
+      thrust::device_ptr<int> dp_cnt2(d_tri_new_count + 1);
+      n_new_tris = thrust::reduce(dp_cnt2, dp_cnt2 + nT_cur);
+    }
+
+    if (n_new_tris == 0) {
+      fprintf(stdout, "[GPU-SPLIT]   pass %d: all splits rejected by validation\n", pass);
+      cudaFree(d_unique_keys);
+      cudaFree(d_new_coords); cudaFree(d_new_normals);
+      if (d_new_met) cudaFree(d_new_met);
+      break;
+    }
+
     /* Step 7: Prefix scan for output offsets */
     thrust::device_ptr<int> dp_newcnt(d_tri_new_count + 1);
     thrust::device_ptr<int> dp_offsets(d_tri_offsets + 1);
@@ -836,6 +1007,24 @@ int MMGS_gpu_split_pass(MMG5_pMesh mesh, MMG5_pSol met) {
     free(h_tri_tag); free(h_tri_edg); free(h_tri_valid);
     free(h_adja); if (h_met_arr) free(h_met_arr);
 
+    /* Debug: check metric values at new vertices */
+    if (met_size > 0) {
+      double met_min = 1e30, met_max = 0.0;
+      for (int k = np + 1; k <= nV_cur; k++) {
+        double mv = met->m[met_size * k];
+        if (mv < met_min) met_min = mv;
+        if (mv > met_max) met_max = mv;
+      }
+      double met_min_old = 1e30, met_max_old = 0.0;
+      for (int k = 1; k <= np; k++) {
+        if (mesh->point[k].c[0] == 0 && mesh->point[k].c[1] == 0 && mesh->point[k].c[2] == 0) continue;
+        double mv = met->m[met_size * k];
+        if (mv < met_min_old) met_min_old = mv;
+        if (mv > met_max_old) met_max_old = mv;
+      }
+      fprintf(stdout, "[GPU-SPLIT] Metric check: old verts [%.8f, %.8f], new verts [%.8f, %.8f]\n",
+              met_min_old, met_max_old, met_min, met_max);
+    }
     fprintf(stdout, "[GPU-SPLIT] Writeback: np=%d nt=%d\n", nV_cur, nT_cur);
   }
 
