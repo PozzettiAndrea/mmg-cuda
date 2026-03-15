@@ -606,10 +606,10 @@ static int anaelt(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
 
 #ifdef WITH_CUDA
   /* GPU-accelerated edge marking for typchk==2 (metric-driven splitting).
-   * Batch-compute all edge lengths on GPU and set pt->flag before the
-   * point-creation loop. This replaces the per-edge MMG5_lenSurfEdg calls.
-   * Only beneficial for large meshes where GPU compute > transfer overhead. */
-  if (typchk == 2 && mesh->info.quality_strategy == 1 && mesh->nt > 500000) {
+   * Uses persistent GPU context to avoid re-uploading mesh data.
+   * Refresh context after CPU modifications, then compute edge lengths on GPU. */
+  if (typchk == 2 && mesh->info.quality_strategy == 1 &&
+      mesh->info.cuda_gpu_ctx && mesh->nt > 100000) {
     double _tmark0 = mmgs_wtime();
     int gpu_ns = anaelt_gpu_mark(mesh, met);
     double _tmark1 = mmgs_wtime();
@@ -1636,31 +1636,33 @@ static int adptri(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int* permNodGlob) {
  * Returns number of triangles with at least one flagged edge, or -1 on failure.
  */
 int anaelt_gpu_mark(MMG5_pMesh mesh, MMG5_pSol met) {
-  double *edge_len = NULL;
-  int *edge_mark = NULL;
+  MMGS_GPUContext *ctx = (MMGS_GPUContext*)mesh->info.cuda_gpu_ctx;
   MMG5_int k, ns;
   int8_t i;
 
-  /* Use the GPU edge length kernel with LLONG threshold */
-  if (!MMGS_edgeLengths_cuda(mesh, met, &edge_len, &edge_mark, NULL, NULL)) {
+  if (!ctx) return -1;
+
+  /* Refresh GPU data after CPU modifications */
+  MMGS_gpu_ctx_refresh(ctx, mesh, met);
+
+  /* Compute edge lengths on GPU-resident data (no full upload!) */
+  if (!MMGS_gpu_ctx_edge_lengths(ctx, mesh, met)) {
     return -1;
   }
 
-  /* Apply the GPU-computed marks to pt->flag */
+  /* Apply GPU-computed lengths to pt->flag */
   ns = 0;
   for (k = 1; k <= mesh->nt; k++) {
     MMG5_pTria pt = &mesh->tria[k];
     if (!MG_EOK(pt) || pt->ref < 0) continue;
 
     pt->flag = 0;
-
-    /* Required triangle */
     if (MS_SIN(pt->tag[0]) && MS_SIN(pt->tag[1]) && MS_SIN(pt->tag[2])) continue;
 
     for (i = 0; i < 3; i++) {
       if (pt->tag[i] & MG_REQ) continue;
-      double len = edge_len[3*k + i];
-      if (!len) { free(edge_len); free(edge_mark); return -1; }
+      double len = MMGS_gpu_ctx_get_edge_len(ctx)[3*k + i];
+      if (!len) return -1;
       if (len > MMGS_LLONG) {
         MG_SET(pt->flag, i);
       }
@@ -1668,8 +1670,6 @@ int anaelt_gpu_mark(MMG5_pMesh mesh, MMG5_pSol met) {
     if (pt->flag) ns++;
   }
 
-  free(edge_len);
-  free(edge_mark);
   return ns;
 }
 #endif

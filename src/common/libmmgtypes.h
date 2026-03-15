@@ -574,6 +574,9 @@ typedef struct {
   int8_t        cuda_save_stage;    /*!< specific stage to save at (-1=none) */
   int8_t        cuda_run_from;      /*!< stage to resume from (-1=start) */
   int8_t        cuda_run_to;        /*!< stage to stop at (-1=end) */
+
+  /* Persistent GPU context (opaque pointer) */
+  void          *cuda_gpu_ctx;      /*!< MMGS_GPUContext* for persistent GPU state */
 #endif
 } MMG5_Info;
 

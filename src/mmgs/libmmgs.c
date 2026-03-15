@@ -731,9 +731,23 @@ int MMGS_mmgslib(MMG5_pMesh mesh,MMG5_pSol met)
   if ( mesh->info.imprim > 0 ||  mesh->info.imprim < -1 ) {
 #ifdef WITH_CUDA
     if (mesh->info.quality_strategy == 1) {
-      if ( !MMGS_triQual_cuda(mesh,met) ) {
-        if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
-        MMGS_RETURN_AND_PACK(mesh,met,sol,MMG5_LOWFAILURE);
+      /* Create persistent GPU context — upload mesh ONCE */
+      MMGS_GPUContext *gpu_ctx = MMGS_gpu_ctx_create(mesh, met);
+      if (gpu_ctx) {
+        MMGS_gpu_ctx_upload(gpu_ctx, mesh, met);
+        if ( !MMGS_gpu_ctx_quality(gpu_ctx, mesh, met) ) {
+          MMGS_gpu_ctx_destroy(gpu_ctx);
+          if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+          MMGS_RETURN_AND_PACK(mesh,met,sol,MMG5_LOWFAILURE);
+        }
+        /* Store context pointer for Phase 2 use via mesh->info */
+        mesh->info.cuda_gpu_ctx = gpu_ctx;
+      } else {
+        /* Fallback */
+        if ( !MMGS_inqua(mesh,met) ) {
+          if ( !MMG5_unscaleMesh(mesh,met,NULL) )    _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
+          MMGS_RETURN_AND_PACK(mesh,met,sol,MMG5_LOWFAILURE);
+        }
       }
     } else
 #endif
@@ -789,6 +803,14 @@ int MMGS_mmgslib(MMG5_pMesh mesh,MMG5_pSol met)
 
   chrono(ON,&(ctim[1]));
   if ( mesh->info.imprim > 0 )  fprintf(stdout,"\n  -- MESH PACKED UP\n");
+
+#ifdef WITH_CUDA
+  /* Destroy GPU context before unscaling */
+  if (mesh->info.cuda_gpu_ctx) {
+    MMGS_gpu_ctx_destroy((MMGS_GPUContext*)mesh->info.cuda_gpu_ctx);
+    mesh->info.cuda_gpu_ctx = NULL;
+  }
+#endif
 
   if ( !MMG5_unscaleMesh(mesh,met,NULL) ) _LIBMMG5_RETURN(mesh,met,sol,MMG5_STRONGFAILURE);
   MMGS_MAYBE_SAVE(MMGS_STAGE_POST_UNSCALE);

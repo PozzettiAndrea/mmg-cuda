@@ -97,7 +97,34 @@ int MMGS_checkpoint_exists(const char *dir, MMGS_PipelineStage stage);
  * GPU kernel dispatch declarations
  * ================================================================ */
 
+/* GPU persistent context — opaque handle */
+typedef struct MMGS_GPUContext MMGS_GPUContext;
+
 #ifdef WITH_CUDA
+
+/** Create persistent GPU context. Allocates GPU memory for mesh. */
+MMGS_GPUContext* MMGS_gpu_ctx_create(MMG5_pMesh mesh, MMG5_pSol met);
+
+/** Upload mesh data to GPU. Call once at start of Phase 2. */
+void MMGS_gpu_ctx_upload(MMGS_GPUContext *ctx, MMG5_pMesh mesh, MMG5_pSol met);
+
+/** Compute quality on GPU-resident data. Downloads only quality array. */
+int MMGS_gpu_ctx_quality(MMGS_GPUContext *ctx, MMG5_pMesh mesh, MMG5_pSol met);
+
+/** Compute edge lengths on GPU-resident data. Downloads only edge arrays. */
+int MMGS_gpu_ctx_edge_lengths(MMGS_GPUContext *ctx, MMG5_pMesh mesh, MMG5_pSol met);
+
+/** Re-upload after CPU modifications (split/collapse/swap/move). */
+void MMGS_gpu_ctx_refresh(MMGS_GPUContext *ctx, MMG5_pMesh mesh, MMG5_pSol met);
+
+/** Destroy GPU context and free GPU memory. */
+void MMGS_gpu_ctx_destroy(MMGS_GPUContext *ctx);
+
+/** Get pointer to pinned host edge length array after MMGS_gpu_ctx_edge_lengths. */
+double* MMGS_gpu_ctx_get_edge_len(MMGS_GPUContext *ctx);
+
+/** Get pointer to pinned host edge mark array after MMGS_gpu_ctx_edge_lengths. */
+int* MMGS_gpu_ctx_get_edge_mark(MMGS_GPUContext *ctx);
 
 /**
  * GPU-accelerated quality computation for all triangles.
