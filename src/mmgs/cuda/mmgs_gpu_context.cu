@@ -50,6 +50,11 @@ struct MMGS_GPUContext {
   double *h_edge_len;    /* 3*(capT) */
   int    *h_edge_mark;   /* 3*(capT) */
 
+  /* Pinned staging for refresh (pre-allocated, reused) */
+  int    *h_tri_v_stage;     /* 3*(capT) */
+  int    *h_tri_valid_stage; /* capT */
+  double *h_coords_stage;   /* 3*(capV) */
+
   /* Sizes */
   int capV, capT;
   int nV, nT;
@@ -95,10 +100,13 @@ MMGS_GPUContext* MMGS_gpu_ctx_create(MMG5_pMesh mesh, MMG5_pSol met) {
     cudaMalloc(&ctx->d_met, (size_t)ctx->met_size * cV * sizeof(double));
   }
 
-  /* Pinned host alloc for fast downloads */
-  cudaMallocHost(&ctx->h_qual,      cT * sizeof(double));
-  cudaMallocHost(&ctx->h_edge_len,  3 * cT * sizeof(double));
-  cudaMallocHost(&ctx->h_edge_mark, 3 * cT * sizeof(int));
+  /* Pinned host alloc for fast downloads + refresh staging */
+  cudaMallocHost(&ctx->h_qual,           cT * sizeof(double));
+  cudaMallocHost(&ctx->h_edge_len,       3 * cT * sizeof(double));
+  cudaMallocHost(&ctx->h_edge_mark,      3 * cT * sizeof(int));
+  cudaMallocHost(&ctx->h_tri_v_stage,    3 * cT * sizeof(int));
+  cudaMallocHost(&ctx->h_tri_valid_stage, cT * sizeof(int));
+  cudaMallocHost(&ctx->h_coords_stage,   3 * cV * sizeof(double));
 
   ctx->uploaded = 0;
 
@@ -156,18 +164,19 @@ void MMGS_gpu_ctx_upload(MMGS_GPUContext *ctx, MMG5_pMesh mesh, MMG5_pSol met) {
   cudaFreeHost(h_tri_valid);
   cudaFreeHost(h_tri_tag);
 
-  /* Metric */
+  /* Metric — use pinned staging for fast transfer */
   if (ctx->met_size > 0 && met && met->m) {
-    cudaMemcpy(ctx->d_met, met->m,
-               (size_t)ctx->met_size * (np + 1) * sizeof(double),
-               cudaMemcpyHostToDevice);
+    size_t met_bytes = (size_t)ctx->met_size * (np + 1) * sizeof(double);
+    double *h_met_pinned;
+    cudaMallocHost(&h_met_pinned, met_bytes);
+    memcpy(h_met_pinned, met->m, met_bytes);
+    cudaMemcpy(ctx->d_met, h_met_pinned, met_bytes, cudaMemcpyHostToDevice);
+    cudaFreeHost(h_met_pinned);
   }
 
   ctx->nV = np;
   ctx->nT = nt;
   ctx->uploaded = 1;
-
-  fprintf(stdout, "[GPU-CTX] Uploaded: %d verts, %d tris\n", np, nt);
 }
 
 void MMGS_gpu_ctx_destroy(MMGS_GPUContext *ctx) {
@@ -184,6 +193,9 @@ void MMGS_gpu_ctx_destroy(MMGS_GPUContext *ctx) {
   cudaFreeHost(ctx->h_qual);
   cudaFreeHost(ctx->h_edge_len);
   cudaFreeHost(ctx->h_edge_mark);
+  cudaFreeHost(ctx->h_tri_v_stage);
+  cudaFreeHost(ctx->h_tri_valid_stage);
+  cudaFreeHost(ctx->h_coords_stage);
   free(ctx);
 }
 
@@ -307,13 +319,50 @@ void MMGS_gpu_ctx_refresh(MMGS_GPUContext *ctx, MMG5_pMesh mesh, MMG5_pSol met) 
   /* Check if mesh grew beyond capacity */
   if (np + 1 > ctx->capV || nt + 1 > ctx->capT) {
     fprintf(stdout, "[GPU-CTX] Mesh grew beyond capacity, full re-upload\n");
-    MMGS_gpu_ctx_destroy(ctx);
-    /* Can't realloc in-place, caller should recreate */
+    ctx->uploaded = 0;
     return;
   }
 
-  /* Re-upload everything (mesh changed unpredictably during CPU operations) */
-  MMGS_gpu_ctx_upload(ctx, mesh, met);
+  /* Re-upload connectivity + validity using pre-allocated pinned staging.
+   * No cudaMallocHost/cudaFreeHost per call — all staging is pre-allocated. */
+  memset(ctx->h_tri_v_stage, 0, 3 * (size_t)ctx->capT * sizeof(int));
+  memset(ctx->h_tri_valid_stage, 0, (size_t)ctx->capT * sizeof(int));
+
+  for (int k = 1; k <= nt; k++) {
+    MMG5_pTria pt = &mesh->tria[k];
+    ctx->h_tri_v_stage[3*k+0] = (int)pt->v[0];
+    ctx->h_tri_v_stage[3*k+1] = (int)pt->v[1];
+    ctx->h_tri_v_stage[3*k+2] = (int)pt->v[2];
+    ctx->h_tri_valid_stage[k] = (pt->v[0] > 0) ? 1 : 0;
+  }
+  /* Only upload up to nt+1 (not full capacity) */
+  cudaMemcpy(ctx->d_tri_v, ctx->h_tri_v_stage,
+             3*(size_t)(nt+1)*sizeof(int), cudaMemcpyHostToDevice);
+  cudaMemcpy(ctx->d_tri_valid, ctx->h_tri_valid_stage,
+             (size_t)(nt+1)*sizeof(int), cudaMemcpyHostToDevice);
+
+  /* Upload new vertex coords+metrics if np grew */
+  if (np > ctx->nV) {
+    int n_new = np - ctx->nV;
+    for (int k = ctx->nV + 1; k <= np; k++) {
+      int idx = k - ctx->nV - 1;
+      ctx->h_coords_stage[3*idx+0] = mesh->point[k].c[0];
+      ctx->h_coords_stage[3*idx+1] = mesh->point[k].c[1];
+      ctx->h_coords_stage[3*idx+2] = mesh->point[k].c[2];
+    }
+    cudaMemcpy(ctx->d_coords + 3*(ctx->nV+1), ctx->h_coords_stage,
+               3*(size_t)n_new*sizeof(double), cudaMemcpyHostToDevice);
+
+    if (ctx->met_size > 0 && met && met->m) {
+      cudaMemcpy(ctx->d_met + (size_t)ctx->met_size*(ctx->nV+1),
+                 met->m + (size_t)ctx->met_size*(ctx->nV+1),
+                 (size_t)ctx->met_size*n_new*sizeof(double),
+                 cudaMemcpyHostToDevice);
+    }
+  }
+
+  ctx->nV = np;
+  ctx->nT = nt;
 }
 
 double* MMGS_gpu_ctx_get_edge_len(MMGS_GPUContext *ctx) {
