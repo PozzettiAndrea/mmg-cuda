@@ -100,6 +100,49 @@ FILE(
 #####
 ############################################################################
 
+# RXMesh remeshing bridge (separate static lib, compiled with nvcc + RXMesh headers)
+IF ( BUILD_RXMESH )
+  ADD_LIBRARY(mmgs_rxmesh_bridge STATIC
+    ${MMGS_SOURCE_DIR}/cuda/rxmesh_remesh/mmgs_rxmesh_bridge.cu
+  )
+  TARGET_INCLUDE_DIRECTORIES(mmgs_rxmesh_bridge PRIVATE
+    ${RXMESH_SOURCE_DIR}/include
+    ${RXMESH_SOURCE_DIR}/external
+    ${RXMESH_SOURCE_DIR}/external/glm
+    ${MMGCOMMON_SOURCE_DIR}
+    ${MMGS_SOURCE_DIR}
+    ${MMGS_SOURCE_DIR}/cuda/rxmesh_remesh
+    ${PROJECT_BINARY_DIR}/src/common
+    ${PROJECT_BINARY_DIR}/include/mmg
+    ${PROJECT_BINARY_DIR}/include/mmg/mmgs
+    ${PROJECT_SOURCE_DIR}/src/common
+    ${PROJECT_SOURCE_DIR}/src/mmgs
+  )
+  TARGET_LINK_LIBRARIES(mmgs_rxmesh_bridge PRIVATE RXMesh CUDA::cudart)
+  SET_TARGET_PROPERTIES(mmgs_rxmesh_bridge PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  )
+
+  # Standalone test executable for RXMesh aniso remeshing
+  # Usage: ./rxmesh_aniso_remesh input.obj [target_len] [num_iter]
+  ADD_EXECUTABLE(rxmesh_aniso_remesh
+    ${MMGS_SOURCE_DIR}/cuda/rxmesh_remesh/standalone_test.cu
+  )
+  TARGET_INCLUDE_DIRECTORIES(rxmesh_aniso_remesh PRIVATE
+    ${RXMESH_SOURCE_DIR}/include
+    ${RXMESH_SOURCE_DIR}/external
+    ${RXMESH_SOURCE_DIR}/external/glm
+    ${MMGS_SOURCE_DIR}/cuda/rxmesh_remesh
+  )
+  TARGET_LINK_LIBRARIES(rxmesh_aniso_remesh PRIVATE RXMesh CUDA::cudart)
+  SET_TARGET_PROPERTIES(rxmesh_aniso_remesh PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+ENDIF()
+
 # Compile static library
 IF ( LIBMMGS_STATIC )
   ADD_AND_INSTALL_LIBRARY ( lib${PROJECT_NAME}s_a STATIC copy_s_headers
@@ -107,6 +150,7 @@ IF ( LIBMMGS_STATIC )
   IF ( BUILD_CUDA )
     SET_TARGET_PROPERTIES(lib${PROJECT_NAME}s_a PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     TARGET_LINK_LIBRARIES(lib${PROJECT_NAME}s_a PRIVATE CUDA::cudart)
+    # Note: RXMesh bridge NOT linked to libmmgs — it's a separate executable for now
   ENDIF()
 ENDIF()
 
