@@ -1,35 +1,69 @@
-/* RXMesh test — load OBJ or use built-in tetrahedron. */
+/* RXMesh GPU isotropic remeshing test.
+ * Loads OBJ, runs split→collapse→flip→smooth on GPU, saves result. */
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
-#include "rxmesh/rxmesh_static.h"
+
 #include "rxmesh/rxmesh_dynamic.h"
 #include "rxmesh/rxmesh.h"
+#include "rxmesh/util/util.h"
+
+#include "glm_compat.h"
+
+using namespace rxmesh;
+
+/* RXMesh Remesh app requires a global Arg struct */
+static char* s_argv[] = {(char*)"test", nullptr};
+static struct arg {
+    std::string obj_file_name;
+    std::string output_folder   = "/tmp";
+    uint32_t    nx              = 66;
+    uint32_t    ny              = 66;
+    float       relative_len    = 1.0f;
+    int         num_smooth_iters = 5;
+    uint32_t    num_iter        = 3;
+    uint32_t    device_id       = 0;
+    char**      argv            = s_argv;
+    int         argc            = 1;
+} Arg;
+
+#include "Remesh/remesh_rxmesh.cuh"
 
 int main(int argc, char** argv) {
-    fprintf(stderr, "[TEST] main()\n"); fflush(stderr);
-    rxmesh::rx_init(0);
-    fprintf(stderr, "[TEST] rx_init done\n"); fflush(stderr);
-
-    if (argc > 1) {
-        /* Load OBJ file */
-        std::string input = argv[1];
-        fprintf(stderr, "[TEST] loading %s...\n", input.c_str()); fflush(stderr);
-        rxmesh::RXMeshStatic rx(input);
-        fprintf(stderr, "[TEST] OK: V=%d E=%d F=%d P=%d\n",
-                rx.get_num_vertices(), rx.get_num_edges(),
-                rx.get_num_faces(), rx.get_num_patches());
-    } else {
-        /* Built-in tetrahedron */
-        std::vector<std::vector<uint32_t>> fv = {
-            {0,1,2}, {0,2,3}, {0,1,4}, {1,2,4}, {2,3,4}, {3,0,4}
-        };
-        fprintf(stderr, "[TEST] creating from %zu faces...\n", fv.size()); fflush(stderr);
-        rxmesh::RXMeshStatic rx(fv);
-        fprintf(stderr, "[TEST] OK: V=%d E=%d F=%d P=%d\n",
-                rx.get_num_vertices(), rx.get_num_edges(),
-                rx.get_num_faces(), rx.get_num_patches());
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s input.obj [relative_len] [iterations]\n", argv[0]);
+        return 1;
     }
 
+    rx_init(0);
+
+    std::string input = argv[1];
+    Arg.obj_file_name = input;
+    if (argc > 2) Arg.relative_len = atof(argv[2]);
+    if (argc > 3) Arg.num_iter = atoi(argv[3]);
+
+    fprintf(stderr, "[REMESH] Loading %s, rel_len=%.2f, iters=%d\n",
+            input.c_str(), Arg.relative_len, Arg.num_iter);
+
+    RXMeshDynamic rx(input, "", 512, 2.0f, 2);
+
+    fprintf(stderr, "[REMESH] Loaded: V=%d E=%d F=%d P=%d\n",
+            rx.get_num_vertices(), rx.get_num_edges(),
+            rx.get_num_faces(), rx.get_num_patches());
+
+    if (!rx.is_edge_manifold()) {
+        fprintf(stderr, "[REMESH] ERROR: not edge-manifold\n");
+        return 1;
+    }
+
+    remesh_rxmesh(rx);
+
+    auto coords = rx.get_input_vertex_coordinates();
+    std::string outpath = "/tmp/rxmesh_remesh_out.obj";
+    rx.export_obj(outpath, *coords);
+
+    fprintf(stderr, "[REMESH] Done: V=%d F=%d → %s\n",
+            rx.get_num_vertices(), rx.get_num_faces(), outpath.c_str());
     return 0;
 }
