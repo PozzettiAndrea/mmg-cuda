@@ -1007,23 +1007,113 @@ int MMGS_gpu_split_pass(MMG5_pMesh mesh, MMG5_pSol met) {
     free(h_tri_tag); free(h_tri_edg); free(h_tri_valid);
     free(h_adja); if (h_met_arr) free(h_met_arr);
 
-    /* Debug: check metric values at new vertices */
-    if (met_size > 0) {
-      double met_min = 1e30, met_max = 0.0;
+    /* Debug: extensive check of new vertex attributes */
+    {
+      int n_zero_met = 0, n_zero_normal = 0, n_bad_coord = 0;
+      double met_min = 1e30, met_max = -1e30;
+      double coord_min[3] = {1e30,1e30,1e30}, coord_max[3] = {-1e30,-1e30,-1e30};
+
       for (int k = np + 1; k <= nV_cur; k++) {
-        double mv = met->m[met_size * k];
-        if (mv < met_min) met_min = mv;
-        if (mv > met_max) met_max = mv;
+        MMG5_pPoint pp = &mesh->point[k];
+
+        /* Check coordinates */
+        if (pp->c[0] == 0.0 && pp->c[1] == 0.0 && pp->c[2] == 0.0) n_bad_coord++;
+        for (int d = 0; d < 3; d++) {
+          if (pp->c[d] < coord_min[d]) coord_min[d] = pp->c[d];
+          if (pp->c[d] > coord_max[d]) coord_max[d] = pp->c[d];
+        }
+
+        /* Check normals */
+        double nn = pp->n[0]*pp->n[0] + pp->n[1]*pp->n[1] + pp->n[2]*pp->n[2];
+        if (nn < 0.01) n_zero_normal++;
+
+        /* Check metric */
+        if (met_size > 0) {
+          double mv = met->m[met_size * k];
+          if (mv == 0.0) n_zero_met++;
+          if (mv < met_min) met_min = mv;
+          if (mv > met_max) met_max = mv;
+        }
       }
-      double met_min_old = 1e30, met_max_old = 0.0;
-      for (int k = 1; k <= np; k++) {
-        if (mesh->point[k].c[0] == 0 && mesh->point[k].c[1] == 0 && mesh->point[k].c[2] == 0) continue;
-        double mv = met->m[met_size * k];
-        if (mv < met_min_old) met_min_old = mv;
-        if (mv > met_max_old) met_max_old = mv;
+
+      /* Also check old vertex metric range for comparison */
+      double met_min_old = 1e30, met_max_old = -1e30;
+      if (met_size > 0) {
+        for (int k = 1; k <= np; k++) {
+          if (mesh->point[k].c[0] == 0 && mesh->point[k].c[1] == 0 &&
+              mesh->point[k].c[2] == 0 && mesh->point[k].tag == 0) continue;
+          double mv = met->m[met_size * k];
+          if (mv < met_min_old) met_min_old = mv;
+          if (mv > met_max_old) met_max_old = mv;
+        }
       }
-      fprintf(stdout, "[GPU-SPLIT] Metric check: old verts [%.8f, %.8f], new verts [%.8f, %.8f]\n",
-              met_min_old, met_max_old, met_min, met_max);
+
+      int n_new = nV_cur - np;
+      fprintf(stdout, "[GPU-SPLIT] Vertex check (%d new verts):\n", n_new);
+      fprintf(stdout, "[GPU-SPLIT]   coords: [%.6f,%.6f,%.6f] - [%.6f,%.6f,%.6f]  bad=%d\n",
+              coord_min[0],coord_min[1],coord_min[2],
+              coord_max[0],coord_max[1],coord_max[2], n_bad_coord);
+      fprintf(stdout, "[GPU-SPLIT]   normals: %d with |n|<0.1\n", n_zero_normal);
+      if (met_size > 0) {
+        fprintf(stdout, "[GPU-SPLIT]   met old: [%.10f, %.10f]\n", met_min_old, met_max_old);
+        fprintf(stdout, "[GPU-SPLIT]   met new: [%.10f, %.10f]  zeros=%d\n", met_min, met_max, n_zero_met);
+      }
+
+      /* Check edge lengths at new vertices — do any edges have insane lengths? */
+      int n_insane = 0;
+      for (int k = 1; k <= nT_cur && n_insane < 5; k++) {
+        MMG5_pTria pt = &mesh->tria[k];
+        if (pt->v[0] <= 0) continue;
+        for (int j = 0; j < 3; j++) {
+          int v0 = (int)pt->v[j], v1 = (int)pt->v[(j+1)%3];
+          /* Check if either vertex is a GPU-created midpoint */
+          if (v0 <= np && v1 <= np) continue;
+          if (met_size == 1 && met->m) {
+            double h0 = met->m[v0], h1 = met->m[v1];
+            double dx = mesh->point[v1].c[0]-mesh->point[v0].c[0];
+            double dy = mesh->point[v1].c[1]-mesh->point[v0].c[1];
+            double dz = mesh->point[v1].c[2]-mesh->point[v0].c[2];
+            double l = sqrt(dx*dx+dy*dy+dz*dz);
+            double r = h1/h0 - 1.0;
+            double len = (fabs(r) < 1e-6) ? l/h0 : l/(h1-h0)*log1p(r);
+            if (len > 10.0 || len < 0.001) {
+              fprintf(stdout, "[GPU-SPLIT]   INSANE edge: tri %d, v%d-v%d, len=%.4f, h0=%.10f h1=%.10f l=%.10f\n",
+                      k, v0, v1, len, h0, h1, l);
+              n_insane++;
+            }
+          }
+        }
+      }
+      if (n_insane == 0) fprintf(stdout, "[GPU-SPLIT]   All edge lengths at new verts OK\n");
+
+      /* Check triangle validity: any invalid vertex refs? duplicate verts? */
+      int n_invalid_tri = 0, n_degenerate = 0, n_bad_ref = 0;
+      for (int k = 1; k <= nT_cur; k++) {
+        MMG5_pTria pt = &mesh->tria[k];
+        if (pt->v[0] <= 0) continue;
+        /* Check vertex indices in range */
+        for (int j = 0; j < 3; j++) {
+          if (pt->v[j] < 1 || pt->v[j] > (MMG5_int)nV_cur) {
+            if (n_invalid_tri < 3)
+              fprintf(stdout, "[GPU-SPLIT]   INVALID TRI %d: v[%d]=%" MMG5_PRId " (nV=%d)\n",
+                      k, j, pt->v[j], nV_cur);
+            n_invalid_tri++;
+          }
+        }
+        /* Check degenerate (duplicate vertices) */
+        if (pt->v[0]==pt->v[1] || pt->v[1]==pt->v[2] || pt->v[0]==pt->v[2])
+          n_degenerate++;
+        /* Check ref for new tris */
+        if (k > nt && pt->ref != 0)
+          n_bad_ref++;
+      }
+      fprintf(stdout, "[GPU-SPLIT]   Tri check: %d invalid, %d degenerate, %d bad_ref (of %d new)\n",
+              n_invalid_tri, n_degenerate, n_bad_ref, nT_cur - nt);
+
+      /* Compare edge length at a GPU-created vertex using CPU function */
+      if (mesh->adja == NULL && nT_cur > 0) {
+        fprintf(stdout, "[GPU-SPLIT]   WARNING: adja is NULL after writeback (will be rebuilt by hashTria)\n");
+      }
     }
     fprintf(stdout, "[GPU-SPLIT] Writeback: np=%d nt=%d\n", nV_cur, nT_cur);
   }

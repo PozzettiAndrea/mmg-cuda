@@ -1475,6 +1475,47 @@ static int adptri(MMG5_pMesh mesh,MMG5_pSol met,MMG5_int* permNodGlob) {
   /* iterative mesh modifications */
   it = nnc = nns = nnf = nnm = 0;
   maxit = 10;
+
+#ifdef WITH_CUDA
+  /* Debug: dump mesh state entering adptri */
+  { /* Quick adptri debug dump — just count valid tris + spot check a few edges */
+    int n_valid = 0;
+    for (MMG5_int kk = 1; kk <= mesh->nt; kk++) {
+      if (mesh->tria[kk].v[0] > 0) n_valid++;
+    }
+    /* Spot check: first 10 edges with new vertices (> np from before anatri_comp) */
+    int n_checked = 0;
+    for (MMG5_int kk = 1; kk <= mesh->nt && n_checked < 10; kk++) {
+      MMG5_pTria pt2 = &mesh->tria[kk];
+      if (pt2->v[0] <= 0) continue;
+      for (int8_t j2 = 0; j2 < 3; j2++) {
+        int8_t j2a = MMG5_inxt2[j2], j2b = MMG5_iprv2[j2];
+        double len2 = MMG5_lenSurfEdg(mesh, met, pt2->v[j2a], pt2->v[j2b], 0);
+        if (len2 > 5.0 && n_checked < 5) {
+          MMG5_int va = pt2->v[j2a], vb = pt2->v[j2b];
+          double dx = mesh->point[vb].c[0]-mesh->point[va].c[0];
+          double dy = mesh->point[vb].c[1]-mesh->point[va].c[1];
+          double dz = mesh->point[vb].c[2]-mesh->point[va].c[2];
+          double eucl = sqrt(dx*dx+dy*dy+dz*dz);
+          fprintf(stdout, "[ADPTRI-IN] LONG: tri %" MMG5_PRId " edge %d: v%" MMG5_PRId
+                  "(%.6f,%.6f,%.6f)-v%" MMG5_PRId "(%.6f,%.6f,%.6f)"
+                  " eucl=%.6f len=%.2f h=%.8f,%.8f\n",
+                  kk, j2, va, mesh->point[va].c[0], mesh->point[va].c[1], mesh->point[va].c[2],
+                  vb, mesh->point[vb].c[0], mesh->point[vb].c[1], mesh->point[vb].c[2],
+                  eucl, len2, met->m[va], met->m[vb]);
+          n_checked++;
+        }
+      }
+    }
+    fprintf(stdout, "[ADPTRI-IN] np=%" MMG5_PRId " nt=%" MMG5_PRId " valid=%d\n",
+            mesh->np, mesh->nt, n_valid);
+    /* Save mesh state for debugging */
+    if (mesh->info.quality_strategy == 1) {
+      MMGS_save_checkpoint(mesh, met, MMGS_STAGE_POST_ADAPT, "/tmp/pre_adptri_debug");
+    }
+  }
+#endif
+
   do {
     if ( !mesh->info.noinsert ) {
       /* NOTE: GPU batch scan of edge lengths is not used here because the
@@ -1652,7 +1693,7 @@ static int anatri(MMG5_pMesh mesh,MMG5_pSol met,int8_t typchk) {
        * This replaces the sequential anaelt scan+split with a fully parallel
        * pipeline: mark → dedup → midpoints → prefix scan → parallel apply → E2E rebuild.
        * Only for typchk==2 (metric-driven) since typchk==1 needs Bezier interpolation. */
-      if (typchk == 2 && mesh->info.quality_strategy == 1 && 0) { /* GPU full split disabled — writeback bug on dragon. GPU marking (below) still active. */
+      if (0 && typchk == 2 && mesh->info.quality_strategy == 1) { /* GPU full split disabled — adptri corruption bug */
         double _tgpu0 = mmgs_wtime();
         int gpu_ns = MMGS_gpu_split_pass(mesh, met);
         double _tgpu1 = mmgs_wtime();
